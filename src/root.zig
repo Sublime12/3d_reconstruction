@@ -15,12 +15,14 @@ pub const mesh = @import("mesh.zig");
 pub const dense = @import("dense.zig");
 pub const render = @import("render.zig");
 pub const viewer_math = @import("viewer_math.zig");
+pub const gpu = @import("gpu.zig");
 
 pub const CliOptions = struct {
     data_dir: []const u8 = "data/fountain-p11",
     out_path: []const u8 = "output/reconstruction.ply",
     max_dim: u32 = 1200,
     num_threads: usize = 1,
+    use_gpu: bool = false,
     verify_views_dir: ?[]const u8 = null,
     show_help: bool = false,
 };
@@ -41,6 +43,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
             i += 1;
             opts.num_threads = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--gpu")) {
+            opts.use_gpu = true;
         } else if (std.mem.eql(u8, args[i], "--verify-views") and i + 1 < args.len) {
             i += 1;
             opts.verify_views_dir = args[i];
@@ -62,6 +66,7 @@ test "parseCliArgs parses flags" {
         "800",
         "--threads",
         "4",
+        "--gpu",
         "--verify-views",
         "output/views",
     };
@@ -70,6 +75,7 @@ test "parseCliArgs parses flags" {
     try std.testing.expectEqualStrings("out/m.ply", opts.out_path);
     try std.testing.expectEqual(@as(u32, 800), opts.max_dim);
     try std.testing.expectEqual(@as(usize, 4), opts.num_threads);
+    try std.testing.expect(opts.use_gpu);
     try std.testing.expectEqualStrings("output/views", opts.verify_views_dir.?);
     try std.testing.expect(!opts.show_help);
 }

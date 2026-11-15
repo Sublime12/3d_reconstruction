@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const opts = try sfm.parseCliArgs(args);
     if (opts.show_help) {
         std.debug.print(
-            "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--verify-views <dir>]\n",
+            "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--gpu] [--verify-views <dir>]\n",
             .{},
         );
         return;
@@ -21,6 +21,7 @@ pub fn main(init: std.process.Init) !void {
     const out_path = opts.out_path;
     const max_dim = opts.max_dim;
     const num_threads = opts.num_threads;
+    const use_gpu = opts.use_gpu;
 
     const k_path = try std.fmt.allocPrint(arena, "{s}/K.txt", .{data_dir});
     const k_text = Io.Dir.cwd().readFileAlloc(io, k_path, arena, .limited(64 * 1024)) catch |err| {
@@ -77,9 +78,9 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("Loaded {s} ({d}x{d})", .{ name, img.width, img.height });
     }
 
-    std.log.info("Running Incremental SfM on {d} images (threads={d})...", .{ images.len, num_threads });
+    std.log.info("Running Incremental SfM on {d} images (threads={d}, gpu={any})...", .{ images.len, num_threads, use_gpu });
     const t_start = Io.Clock.now(.awake, io);
-    var result = try sfm.pipeline.runIncrementalSfm(gpa, k, images, .{ .num_threads = num_threads });
+    var result = try sfm.pipeline.runIncrementalSfm(gpa, k, images, .{ .num_threads = num_threads, .use_gpu = use_gpu });
     defer result.deinit(gpa);
     const elapsed_ns = t_start.durationTo(Io.Clock.now(.awake, io)).nanoseconds;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1e6;

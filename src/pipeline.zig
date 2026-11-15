@@ -10,6 +10,7 @@ const triangulation = @import("triangulation.zig");
 const pnp = @import("pnp.zig");
 const ba = @import("bundle_adjust.zig");
 const dataset = @import("dataset.zig");
+const gpu = @import("gpu.zig");
 const Color = @import("io_ply.zig").Color;
 
 pub const TrackObs = struct {
@@ -41,6 +42,8 @@ pub const SfmConfig = struct {
     seed: u64 = 42,
     /// 1 = single-threaded CPU, 0 = auto-detect CPU core count, >1 = explicit thread count
     num_threads: usize = 1,
+    /// Enable WebGPU compute acceleration (Harris corner scoring and batched descriptor matching).
+    use_gpu: bool = false,
     enable_guided_densification: bool = true,
     guided_epipolar_thresh_px: f64 = 1.4,
     guided_match_ratio: f64 = 0.90,
@@ -78,7 +81,10 @@ pub fn runIncrementalSfm(
 
     const effective_threads = resolveThreadCount(config.num_threads);
 
-    // 1. Feature detection (single-threaded or multi-threaded)
+    var gpu_ctx_opt: ?gpu.GpuContext = if (config.use_gpu) try gpu.GpuContext.init() else null;
+    defer if (gpu_ctx_opt) |*g| g.deinit();
+
+    // 1. Feature detection (CPU single/multi-threaded or WebGPU Harris + CPU NMS/BRIEF)
     const all_kps = try allocator.alloc([]features.Keypoint, n_cams);
     for (all_kps) |*slot| slot.* = &.{};
     defer {
@@ -98,7 +104,70 @@ pub fn runIncrementalSfm(
         allocator.free(all_cols);
     }
 
-    if (effective_threads <= 1 or n_cams <= 1) {
+    if (gpu_ctx_opt) |*gpu_ctx| {
+        const default_tile: features.TileConfig = .{};
+        const harris_maps = try allocator.alloc(?gpu.GpuContext.HarrisGpuOutput, n_cams);
+        @memset(harris_maps, null);
+        defer {
+            for (harris_maps) |hm_opt| {
+                if (hm_opt) |hm| {
+                    allocator.free(hm.blurred);
+                    allocator.free(hm.score);
+                }
+            }
+            allocator.free(harris_maps);
+        }
+
+        for (images, 0..) |img, ci| {
+            if (img.width >= 40 and img.height >= 40 and config.max_keypoints > 0) {
+                harris_maps[ci] = try gpu_ctx.computeHarrisScores(
+                    allocator,
+                    img.gray,
+                    img.width,
+                    img.height,
+                    default_tile.min_harris_score,
+                );
+            }
+        }
+
+        if (effective_threads <= 1 or n_cams <= 1) {
+            for (0..n_cams) |ci| {
+                try finishGpuImageFeatures(
+                    allocator,
+                    images[ci],
+                    harris_maps[ci],
+                    config.max_keypoints,
+                    default_tile,
+                    &all_kps[ci],
+                    &all_uvs[ci],
+                    &all_cols[ci],
+                );
+            }
+        } else {
+            var next_cam = std.atomic.Value(usize).init(0);
+            const worker_count = @min(effective_threads, n_cams);
+            const threads = try allocator.alloc(std.Thread, worker_count);
+            defer allocator.free(threads);
+            var failed = std.atomic.Value(bool).init(false);
+
+            for (threads) |*th| {
+                th.* = try std.Thread.spawn(.{}, finishGpuDetectWorker, .{
+                    allocator,
+                    images,
+                    harris_maps,
+                    config.max_keypoints,
+                    default_tile,
+                    all_kps,
+                    all_uvs,
+                    all_cols,
+                    &next_cam,
+                    &failed,
+                });
+            }
+            for (threads) |th| th.join();
+            if (failed.load(.acquire)) return error.FeatureExtractionFailed;
+        }
+    } else if (effective_threads <= 1 or n_cams <= 1) {
         for (0..n_cams) |ci| {
             try detectImageFeatures(allocator, images[ci], config.max_keypoints, &all_kps[ci], &all_uvs[ci], &all_cols[ci]);
         }
@@ -125,7 +194,7 @@ pub fn runIncrementalSfm(
         if (failed.load(.acquire)) return error.FeatureExtractionFailed;
     }
 
-    // 2. Pairwise matching + geometric verification (single-threaded or multi-threaded)
+    // 2. Pairwise matching + geometric verification (WebGPU batched or CPU single/multi-threaded)
     const n_pairs = (n_cams * (n_cams - 1)) / 2;
     const pair_indices = try allocator.alloc([2]usize, n_pairs);
     defer allocator.free(pair_indices);
@@ -146,9 +215,27 @@ pub fn runIncrementalSfm(
         allocator.free(pair_slots);
     }
 
+    var gpu_raw_matches: ?[][]features.Match = null;
+    if (gpu_ctx_opt) |*gpu_ctx| {
+        gpu_raw_matches = try gpu_ctx.matchDescriptorPairsBatch(
+            allocator,
+            all_kps,
+            pair_indices,
+            config.match_ratio,
+            config.max_hamming,
+        );
+    }
+    defer if (gpu_raw_matches) |batch| {
+        for (batch) |ms| allocator.free(ms);
+        allocator.free(batch);
+    };
+
     if (effective_threads <= 1 or n_pairs <= 1) {
         for (pair_indices, 0..) |pair, idx| {
-            pair_slots[idx] = try verifyPair(allocator, k, all_kps, all_uvs, pair[0], pair[1], config);
+            pair_slots[idx] = if (gpu_raw_matches) |batch|
+                try verifyPairFromMatches(allocator, k, all_uvs, pair[0], pair[1], batch[idx], config)
+            else
+                try verifyPair(allocator, k, all_kps, all_uvs, pair[0], pair[1], config);
         }
     } else {
         var next_pair = std.atomic.Value(usize).init(0);
@@ -164,6 +251,7 @@ pub fn runIncrementalSfm(
                 all_kps,
                 all_uvs,
                 pair_indices,
+                gpu_raw_matches,
                 pair_slots,
                 config,
                 &next_pair,
@@ -1216,19 +1304,14 @@ fn resolveThreadCount(num_threads: usize) usize {
     return num_threads;
 }
 
-fn detectImageFeatures(
+fn packImageFeaturesFromKps(
     allocator: std.mem.Allocator,
     img: dataset.ImageData,
-    max_keypoints: usize,
+    kps: []features.Keypoint,
     out_kps: *[]features.Keypoint,
     out_uvs: *[]Vec2,
     out_cols: *[]Color,
 ) !void {
-    const kps = try features.detectAndCompute(
-        allocator,
-        .{ .width = img.width, .height = img.height, .gray = img.gray },
-        max_keypoints,
-    );
     errdefer allocator.free(kps);
 
     const uvs = try allocator.alloc(Vec2, kps.len);
@@ -1251,6 +1334,62 @@ fn detectImageFeatures(
     out_kps.* = kps;
     out_uvs.* = uvs;
     out_cols.* = cols;
+}
+
+fn detectImageFeatures(
+    allocator: std.mem.Allocator,
+    img: dataset.ImageData,
+    max_keypoints: usize,
+    out_kps: *[]features.Keypoint,
+    out_uvs: *[]Vec2,
+    out_cols: *[]Color,
+) !void {
+    const kps = try features.detectAndCompute(
+        allocator,
+        .{ .width = img.width, .height = img.height, .gray = img.gray },
+        max_keypoints,
+    );
+    try packImageFeaturesFromKps(allocator, img, kps, out_kps, out_uvs, out_cols);
+}
+
+fn finishGpuImageFeatures(
+    allocator: std.mem.Allocator,
+    img: dataset.ImageData,
+    harris_opt: ?gpu.GpuContext.HarrisGpuOutput,
+    max_keypoints: usize,
+    tile_cfg: features.TileConfig,
+    out_kps: *[]features.Keypoint,
+    out_uvs: *[]Vec2,
+    out_cols: *[]Color,
+) !void {
+    const kps = if (harris_opt) |hm|
+        try features.detectFromScores(allocator, img.width, img.height, hm.blurred, hm.score, max_keypoints, tile_cfg)
+    else
+        try allocator.alloc(features.Keypoint, 0);
+    try packImageFeaturesFromKps(allocator, img, kps, out_kps, out_uvs, out_cols);
+}
+
+fn finishGpuDetectWorker(
+    allocator: std.mem.Allocator,
+    images: []const dataset.ImageData,
+    harris_maps: []const ?gpu.GpuContext.HarrisGpuOutput,
+    max_keypoints: usize,
+    tile_cfg: features.TileConfig,
+    all_kps: [][]features.Keypoint,
+    all_uvs: [][]Vec2,
+    all_cols: [][]Color,
+    next_cam: *std.atomic.Value(usize),
+    failed: *std.atomic.Value(bool),
+) void {
+    while (true) {
+        if (failed.load(.acquire)) return;
+        const ci = next_cam.fetchAdd(1, .monotonic);
+        if (ci >= images.len) return;
+        finishGpuImageFeatures(allocator, images[ci], harris_maps[ci], max_keypoints, tile_cfg, &all_kps[ci], &all_uvs[ci], &all_cols[ci]) catch {
+            failed.store(true, .release);
+            return;
+        };
+    }
 }
 
 fn detectWorker(
@@ -1291,6 +1430,18 @@ fn verifyPair(
         config.max_hamming,
     );
     defer allocator.free(raw_matches);
+    return verifyPairFromMatches(allocator, k, all_uvs, i, j, raw_matches, config);
+}
+
+fn verifyPairFromMatches(
+    allocator: std.mem.Allocator,
+    k: Mat3,
+    all_uvs: []const []const Vec2,
+    i: usize,
+    j: usize,
+    raw_matches: []const features.Match,
+    config: SfmConfig,
+) !?PairwiseVerified {
     if (raw_matches.len < 16) return null;
 
     const pts1 = try allocator.alloc(Vec2, raw_matches.len);
@@ -1334,6 +1485,7 @@ fn verifyPairWorker(
     all_kps: []const []const features.Keypoint,
     all_uvs: []const []const Vec2,
     pair_indices: []const [2]usize,
+    gpu_raw_matches: ?[]const []const features.Match,
     pair_slots: []?PairwiseVerified,
     config: SfmConfig,
     next_pair: *std.atomic.Value(usize),
@@ -1344,7 +1496,10 @@ fn verifyPairWorker(
         const idx = next_pair.fetchAdd(1, .monotonic);
         if (idx >= pair_indices.len) return;
         const pair = pair_indices[idx];
-        pair_slots[idx] = verifyPair(allocator, k, all_kps, all_uvs, pair[0], pair[1], config) catch {
+        pair_slots[idx] = (if (gpu_raw_matches) |batch|
+            verifyPairFromMatches(allocator, k, all_uvs, pair[0], pair[1], batch[idx], config)
+        else
+            verifyPair(allocator, k, all_kps, all_uvs, pair[0], pair[1], config)) catch {
             failed.store(true, .release);
             return;
         };
@@ -1547,4 +1702,90 @@ test "Guided epipolar densification recovers additional 3D points along epipolar
 
     try std.testing.expectEqual(@as(usize, 3), added);
     try std.testing.expectEqual(@as(usize, 3), points3d.items.len);
+}
+
+test "runIncrementalSfm with use_gpu matches CPU reconstruction" {
+    const gpa = std.testing.allocator;
+    const w: u32 = 320;
+    const h: u32 = 240;
+    const k = Mat3.fromRows(
+        .{ 320, 0, 160 },
+        .{ 0, 320, 120 },
+        .{ 0, 0, 1 },
+    );
+
+    const n_cams: usize = 3;
+    const cam_poses = [_]CameraPose{
+        CameraPose.identity,
+        .{ .r = lie.so3Exp(Vec3.init(0.0, -0.06, 0.0)), .t = Vec3.init(-0.35, 0.0, 0.02) },
+        .{ .r = lie.so3Exp(Vec3.init(0.0, -0.12, 0.0)), .t = Vec3.init(-0.70, 0.0, 0.05) },
+    };
+
+    var prng = std.Random.DefaultPrng.init(101);
+    const rng = prng.random();
+    var world_pts: [90]Vec3 = undefined;
+    var world_freq_x: [90]f64 = undefined;
+    var world_freq_y: [90]f64 = undefined;
+    for (&world_pts, &world_freq_x, &world_freq_y) |*pt, *fx, *fy| {
+        pt.* = Vec3.init(
+            rng.float(f64) * 3.0 - 1.5,
+            rng.float(f64) * 2.0 - 1.0,
+            5.0 + rng.float(f64) * 2.5,
+        );
+        fx.* = 0.25 + rng.float(f64) * 0.45;
+        fy.* = 0.25 + rng.float(f64) * 0.45;
+    }
+
+    var images: [n_cams]dataset.ImageData = undefined;
+    for (0..n_cams) |ci| {
+        const gray = try gpa.alloc(u8, w * h);
+        const rgb = try gpa.alloc(u8, w * h * 3);
+        @memset(gray, 128);
+        @memset(rgb, 128);
+        for (world_pts, world_freq_x, world_freq_y, 0..) |pt, fx, fy, pi| {
+            const uv = lie.projectPoint(k, cam_poses[ci], pt) orelse continue;
+            if (uv.x < 12 or uv.x >= @as(f64, @floatFromInt(w - 12)) or uv.y < 12 or uv.y >= @as(f64, @floatFromInt(h - 12))) continue;
+            const cx: isize = @intFromFloat(@round(uv.x));
+            const cy: isize = @intFromFloat(@round(uv.y));
+            const phase = @as(f64, @floatFromInt(pi)) * 0.7;
+            var dy: isize = -6;
+            while (dy <= 6) : (dy += 1) {
+                var dx: isize = -6;
+                while (dx <= 6) : (dx += 1) {
+                    const idx = @as(usize, @intCast(cy + dy)) * w + @as(usize, @intCast(cx + dx));
+                    const dxf: f64 = @floatFromInt(dx);
+                    const dyf: f64 = @floatFromInt(dy);
+                    const env = @exp(-(dxf * dxf + dyf * dyf) * 0.06);
+                    const wave = 95.0 * env * @sin(dxf * fx + phase) * @cos(dyf * fy - phase);
+                    const v: u8 = @intFromFloat(std.math.clamp(128.0 + wave, 0.0, 255.0));
+                    gray[idx] = v;
+                    rgb[idx * 3 + 0] = v;
+                    rgb[idx * 3 + 1] = v;
+                    rgb[idx * 3 + 2] = v;
+                }
+            }
+        }
+        images[ci] = .{ .width = w, .height = h, .rgb = rgb, .gray = gray };
+    }
+    defer for (&images) |*img| img.deinit(gpa);
+
+    const cfg_cpu: SfmConfig = .{
+        .max_keypoints = 600,
+        .num_threads = 1,
+        .use_gpu = false,
+        .enable_guided_densification = false,
+        .ransac_iters = 200,
+    };
+    var cfg_gpu = cfg_cpu;
+    cfg_gpu.use_gpu = true;
+
+    var res_cpu = try runIncrementalSfm(gpa, k, &images, cfg_cpu);
+    defer res_cpu.deinit(gpa);
+    var res_gpu = try runIncrementalSfm(gpa, k, &images, cfg_gpu);
+    defer res_gpu.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, n_cams), res_cpu.registered_count);
+    try std.testing.expectEqual(@as(usize, n_cams), res_gpu.registered_count);
+    try std.testing.expect(res_gpu.points.len >= 15);
+    try std.testing.expect(res_gpu.mean_reproj_err < 2.0);
 }

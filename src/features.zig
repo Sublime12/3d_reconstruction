@@ -70,10 +70,23 @@ pub fn detectAndComputeWithConfig(
     const h: usize = img.height;
     if (w < 40 or h < 40 or max_keypoints == 0) return try allocator.alloc(Keypoint, 0);
 
-    const n = w * h;
     const blurred = try gaussianBlur5x5(allocator, img.gray, w, h);
     defer allocator.free(blurred);
 
+    const score = try computeHarrisScores(allocator, blurred, w, h, tile_cfg.min_harris_score);
+    defer allocator.free(score);
+
+    return try detectFromScores(allocator, w, h, blurred, score, max_keypoints, tile_cfg);
+}
+
+pub fn computeHarrisScores(
+    allocator: std.mem.Allocator,
+    blurred: []const u8,
+    w: usize,
+    h: usize,
+    min_harris_score: f32,
+) ![]f32 {
+    const n = w * h;
     const ix2 = try allocator.alloc(f32, n);
     defer allocator.free(ix2);
     const iy2 = try allocator.alloc(f32, n);
@@ -108,7 +121,6 @@ pub fn detectAndComputeWithConfig(
     }
 
     const score = try allocator.alloc(f32, n);
-    defer allocator.free(score);
     @memset(score, 0);
 
     const border: usize = 10;
@@ -130,11 +142,27 @@ pub fn detectAndComputeWithConfig(
             const det_m = sxx * syy - sxy * sxy;
             const trace_m = sxx + syy;
             const r = det_m - 0.04 * trace_m * trace_m;
-            if (r > tile_cfg.min_harris_score) {
+            if (r > min_harris_score) {
                 score[y * w + x] = r;
             }
         }
     }
+
+    return score;
+}
+
+/// Runs tiled 5x5 NMS, spatially-uniform round-robin selection, orientation, and BRIEF from precomputed blur & Harris scores.
+pub fn detectFromScores(
+    allocator: std.mem.Allocator,
+    w: usize,
+    h: usize,
+    blurred: []const u8,
+    score: []const f32,
+    max_keypoints: usize,
+    tile_cfg: TileConfig,
+) ![]Keypoint {
+    if (w < 40 or h < 40 or max_keypoints == 0) return try allocator.alloc(Keypoint, 0);
+    const border: usize = 10;
 
     const cols = @max(@as(usize, 1), @min(tile_cfg.grid_cols, w / 24));
     const rows = @max(@as(usize, 1), @min(tile_cfg.grid_rows, h / 24));
@@ -310,7 +338,7 @@ fn computeBrief(img: []const u8, w: usize, h: usize, kx: f64, ky: f64, angle: f6
     return desc;
 }
 
-fn gaussianBlur5x5(allocator: std.mem.Allocator, src: []const u8, w: usize, h: usize) ![]u8 {
+pub fn gaussianBlur5x5(allocator: std.mem.Allocator, src: []const u8, w: usize, h: usize) ![]u8 {
     const tmp = try allocator.alloc(u16, w * h);
     defer allocator.free(tmp);
     const dst = try allocator.alloc(u8, w * h);

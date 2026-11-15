@@ -35,16 +35,28 @@ pub fn build(b: *std.Build) void {
     });
     const c_img_mod = translate_c.createModule();
 
+    const translate_wgpu = b.addTranslateC(.{
+        .root_source_file = b.path("src/c_wgpu.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_wgpu.addIncludePath(b.path("third_party/wgpu-native/include"));
+    const c_wgpu_mod = translate_wgpu.createModule();
+
     const mod = b.addModule("simple_3d_reconstruction", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .link_libc = true,
         .imports = &.{
             .{ .name = "c_img", .module = c_img_mod },
+            .{ .name = "c_wgpu", .module = c_wgpu_mod },
         },
     });
     mod.linkSystemLibrary("png", .{});
     mod.linkSystemLibrary("jpeg", .{});
+    mod.addLibraryPath(b.path("third_party/wgpu-native/lib"));
+    mod.addRPath(b.path("third_party/wgpu-native/lib"));
+    mod.linkSystemLibrary("wgpu_native", .{});
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
