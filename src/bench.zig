@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const sfm = @import("simple_3d_reconstruction");
+const sfm = @import("3d_reconstruction");
 
 fn generateSyntheticDataset(allocator: std.mem.Allocator, n_cams: usize, w: u32, h: u32) !struct {
     k: sfm.mat.Mat3,

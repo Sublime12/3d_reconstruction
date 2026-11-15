@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const sfm = @import("simple_3d_reconstruction");
+const sfm = @import("3d_reconstruction");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const opts = try sfm.parseCliArgs(args);
     if (opts.show_help) {
         std.debug.print(
-            "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--gpu] [--nn-model <onnx>] [--verify-views <dir>]\n",
+            "Usage: 3d_reconstruction [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--gpu] [--nn-model <onnx>] [--verify-views <dir>]\n",
             .{},
         );
         return;

@@ -3,6 +3,7 @@ const Vec3 = @import("math/vec.zig").Vec3;
 const Mat3 = @import("math/mat.zig").Mat3;
 const lie = @import("math/lie.zig");
 const CameraPose = lie.CameraPose;
+const render = @import("render.zig");
 
 pub const Mat4 = struct {
     // Column-major for OpenGL (element at col c, row r is m[c * 4 + r])
@@ -251,20 +252,268 @@ pub const OrbitFrame = struct {
             .{ cam_fwd.x, cam_fwd.y, cam_fwd.z },
         } };
         const eye = self.target.sub(cam_fwd.scale(self.dist));
-        return .{
-            .r = r,
-            .t = r.mulVec(eye).neg(),
-        };
+        return poseFromRotationAndEye(r, eye);
     }
 
     pub fn pan(self: *OrbitFrame, dx_norm: f64, dy_norm: f64) void {
-        const pose = self.toPose();
-        const right = Vec3.init(pose.r.m[0][0], pose.r.m[0][1], pose.r.m[0][2]);
-        const down = Vec3.init(pose.r.m[1][0], pose.r.m[1][1], pose.r.m[1][2]);
-        const scale = self.dist * 0.8;
-        self.target = self.target
-            .sub(right.scale(dx_norm * scale))
-            .sub(down.scale(dy_norm * scale));
+        self.target = displaceInCameraPlane(self.target, self.toPose(), dx_norm, dy_norm, self.dist * 0.8);
+    }
+
+    pub fn moveTargetLocal(self: *OrbitFrame, d_right: f64, d_up: f64, d_fwd: f64) void {
+        self.target = displaceAlongCameraAxes(self.target, self.toPose(), d_right, d_up, d_fwd);
+    }
+};
+
+pub const CameraAxes = struct {
+    right: Vec3,
+    down: Vec3,
+    fwd: Vec3,
+};
+
+pub fn poseFromRotationAndEye(r: Mat3, eye: Vec3) CameraPose {
+    return .{
+        .r = r,
+        .t = r.mulVec(eye).neg(),
+    };
+}
+
+pub fn cameraAxes(pose: CameraPose) CameraAxes {
+    return .{
+        .right = Vec3.init(pose.r.m[0][0], pose.r.m[0][1], pose.r.m[0][2]),
+        .down = Vec3.init(pose.r.m[1][0], pose.r.m[1][1], pose.r.m[1][2]),
+        .fwd = Vec3.init(pose.r.m[2][0], pose.r.m[2][1], pose.r.m[2][2]),
+    };
+}
+
+pub fn displaceInCameraPlane(pos: Vec3, pose: CameraPose, dx_norm: f64, dy_norm: f64, scale: f64) Vec3 {
+    const ax = cameraAxes(pose);
+    return pos
+        .sub(ax.right.scale(dx_norm * scale))
+        .sub(ax.down.scale(dy_norm * scale));
+}
+
+pub fn displaceAlongCameraAxes(pos: Vec3, pose: CameraPose, d_right: f64, d_up: f64, d_fwd: f64) Vec3 {
+    const ax = cameraAxes(pose);
+    return pos
+        .add(ax.right.scale(d_right))
+        .sub(ax.down.scale(d_up))
+        .add(ax.fwd.scale(d_fwd));
+}
+
+/// First-person view anchored to a camera's initial optical center and coordinate frame;
+/// yaw/pitch rotate in place while translation follows the current camera axes.
+pub const FirstPersonFrame = struct {
+    eye: Vec3,
+    base_r: Mat3,
+    yaw: f64,
+    pitch: f64,
+
+    pub fn fromPose(pose: CameraPose) FirstPersonFrame {
+        return .{
+            .eye = pose.cameraCenter(),
+            .base_r = pose.r,
+            .yaw = 0.0,
+            .pitch = 0.0,
+        };
+    }
+
+    pub fn toPose(self: FirstPersonFrame) CameraPose {
+        const cy = @cos(self.yaw);
+        const sy = @sin(self.yaw);
+        const cp = @cos(self.pitch);
+        const sp = @sin(self.pitch);
+
+        const r_local = Mat3{ .m = .{
+            .{ cy, 0.0, -sy },
+            .{ -sy * sp, cp, -cy * sp },
+            .{ sy * cp, sp, cy * cp },
+        } };
+        return poseFromRotationAndEye(r_local.mul(self.base_r), self.eye);
+    }
+
+    pub fn rotate(self: *FirstPersonFrame, d_yaw: f64, d_pitch: f64) void {
+        self.yaw += d_yaw;
+        self.pitch = std.math.clamp(self.pitch + d_pitch, -1.45, 1.45);
+    }
+
+    pub fn moveLocal(self: *FirstPersonFrame, d_right: f64, d_up: f64, d_fwd: f64) void {
+        self.eye = displaceAlongCameraAxes(self.eye, self.toPose(), d_right, d_up, d_fwd);
+    }
+
+    pub fn pan(self: *FirstPersonFrame, dx_norm: f64, dy_norm: f64, scale: f64) void {
+        self.eye = displaceInCameraPlane(self.eye, self.toPose(), dx_norm, dy_norm, scale);
+    }
+};
+
+pub const ViewMode = enum {
+    orbit,
+    camera,
+};
+
+/// Unified viewer state switching between scene Orbit and clicked-camera FirstPerson control.
+pub const ViewerController = struct {
+    mode: ViewMode = .orbit,
+    orbit: OrbitFrame,
+    fp: FirstPersonFrame,
+    scene_center: Vec3,
+    cam_spacing: f64,
+    active_cam: ?usize = null,
+    cam_modified: bool = false,
+    overlay_mode: u8 = 0,
+    anim_active: bool = false,
+    anim_t: f64 = 1.0,
+    anim_from_pose: CameraPose,
+    anim_to_pose: CameraPose,
+    current_pose: CameraPose,
+
+    pub fn init(points: []const Vec3, cam_poses: []const CameraPose, cam_spacing: f64) ViewerController {
+        const orbit = OrbitFrame.fromScene(points, cam_poses);
+        const start_pose = orbit.toPose();
+        return .{
+            .orbit = orbit,
+            .fp = FirstPersonFrame.fromPose(start_pose),
+            .scene_center = orbit.target,
+            .cam_spacing = cam_spacing,
+            .anim_from_pose = start_pose,
+            .anim_to_pose = start_pose,
+            .current_pose = start_pose,
+        };
+    }
+
+    pub fn enterCamera(self: *ViewerController, cam_idx: usize, pose: CameraPose) void {
+        self.mode = .camera;
+        self.active_cam = cam_idx;
+        self.cam_modified = false;
+        self.fp = FirstPersonFrame.fromPose(pose);
+        self.startAnimTo(self.fp.toPose());
+    }
+
+    pub fn enterOrbit(self: *ViewerController) void {
+        self.mode = .orbit;
+        self.active_cam = null;
+        self.cam_modified = false;
+        self.overlay_mode = 0;
+        self.startAnimTo(self.orbit.toPose());
+    }
+
+    pub fn toggleOverlay(self: *ViewerController, cam_poses: []const CameraPose) void {
+        const ac = self.active_cam orelse return;
+        if (self.mode == .camera and self.cam_modified) {
+            self.enterCamera(ac, cam_poses[ac]);
+            self.overlay_mode = 1;
+            return;
+        }
+        self.overlay_mode = (self.overlay_mode + 1) % 3;
+    }
+
+    pub fn shouldDrawPhotoOverlay(self: *const ViewerController) bool {
+        return self.mode == .camera and self.active_cam != null and !self.cam_modified and !self.anim_active and self.overlay_mode > 0;
+    }
+
+    fn startAnimTo(self: *ViewerController, target: CameraPose) void {
+        self.anim_active = true;
+        self.anim_t = 0.0;
+        self.anim_from_pose = self.current_pose;
+        self.anim_to_pose = target;
+    }
+
+    fn prepareDirectControl(self: *ViewerController) void {
+        if (!self.anim_active) return;
+        self.anim_active = false;
+        if (self.mode == .camera) {
+            self.fp = FirstPersonFrame.fromPose(self.current_pose);
+        }
+    }
+
+    fn markCameraModified(self: *ViewerController) void {
+        self.cam_modified = true;
+        self.overlay_mode = 0;
+    }
+
+    fn panScale(self: *const ViewerController) f64 {
+        const dist = self.scene_center.sub(self.fp.eye).norm();
+        return std.math.clamp(dist * 0.75, @max(0.4, self.cam_spacing * 0.8), 40.0);
+    }
+
+    pub fn rotateDrag(self: *ViewerController, dx: f64, dy: f64) void {
+        self.prepareDirectControl();
+        switch (self.mode) {
+            .camera => {
+                self.fp.rotate(dx * 0.0028, dy * 0.0028);
+                self.markCameraModified();
+                self.current_pose = self.fp.toPose();
+            },
+            .orbit => {
+                self.orbit.yaw += dx * 0.006;
+                self.orbit.pitch = std.math.clamp(self.orbit.pitch + dy * 0.006, -1.45, 1.45);
+                self.current_pose = self.orbit.toPose();
+            },
+        }
+    }
+
+    pub fn panDrag(self: *ViewerController, dx_norm: f64, dy_norm: f64) void {
+        self.prepareDirectControl();
+        switch (self.mode) {
+            .camera => {
+                self.fp.pan(dx_norm, dy_norm, self.panScale());
+                self.markCameraModified();
+                self.current_pose = self.fp.toPose();
+            },
+            .orbit => {
+                self.orbit.pan(dx_norm, dy_norm);
+                self.current_pose = self.orbit.toPose();
+            },
+        }
+    }
+
+    pub fn scrollMove(self: *ViewerController, scroll_y: f64) void {
+        self.prepareDirectControl();
+        switch (self.mode) {
+            .camera => {
+                const dist = self.scene_center.sub(self.fp.eye).norm();
+                const step = scroll_y * @max(self.cam_spacing * 0.25, dist * 0.08);
+                self.fp.moveLocal(0.0, 0.0, step);
+                self.markCameraModified();
+                self.current_pose = self.fp.toPose();
+            },
+            .orbit => {
+                const zoom_factor = std.math.pow(f64, 0.88, scroll_y);
+                self.orbit.dist = std.math.clamp(self.orbit.dist * zoom_factor, 0.3, 80.0);
+                self.current_pose = self.orbit.toPose();
+            },
+        }
+    }
+
+    pub fn moveWasd(self: *ViewerController, d_right: f64, d_up: f64, d_fwd: f64) void {
+        self.prepareDirectControl();
+        switch (self.mode) {
+            .camera => {
+                self.fp.moveLocal(d_right, d_up, d_fwd);
+                self.markCameraModified();
+                self.current_pose = self.fp.toPose();
+            },
+            .orbit => {
+                self.orbit.moveTargetLocal(d_right, d_up, d_fwd);
+                self.current_pose = self.orbit.toPose();
+            },
+        }
+    }
+
+    pub fn tick(self: *ViewerController, dt: f64) void {
+        if (self.anim_active) {
+            self.anim_t = @min(1.0, self.anim_t + dt / 0.35);
+            const ease = 1.0 - std.math.pow(f64, 1.0 - self.anim_t, 3.0);
+            self.current_pose = render.interpolatePose(self.anim_from_pose, self.anim_to_pose, ease);
+            if (self.anim_t >= 1.0) {
+                self.anim_active = false;
+                self.current_pose = self.anim_to_pose;
+            }
+        } else {
+            self.current_pose = switch (self.mode) {
+                .camera => self.fp.toPose(),
+                .orbit => self.orbit.toPose(),
+            };
+        }
     }
 };
 
@@ -321,17 +570,22 @@ pub fn raySphereIntersect(ray: Ray, center: Vec3, radius: f64) ?f64 {
     return null;
 }
 
-pub fn pickCamera(
+fn pickCameraWithMinEyeDist(
     ray: Ray,
+    eye: ?Vec3,
     poses: []const CameraPose,
     registered: []const bool,
     hit_radius: f64,
+    min_eye_dist: f64,
 ) ?usize {
     var best_idx: ?usize = null;
     var best_t: f64 = std.math.inf(f64);
     for (poses, registered, 0..) |pose, is_reg, idx| {
         if (!is_reg) continue;
         const c = pose.cameraCenter();
+        if (eye) |e| {
+            if (c.sub(e).norm() <= min_eye_dist) continue;
+        }
         if (raySphereIntersect(ray, c, hit_radius)) |t| {
             if (t < best_t) {
                 best_t = t;
@@ -340,6 +594,26 @@ pub fn pickCamera(
         }
     }
     return best_idx;
+}
+
+pub fn pickCamera(
+    ray: Ray,
+    poses: []const CameraPose,
+    registered: []const bool,
+    hit_radius: f64,
+) ?usize {
+    return pickCameraWithMinEyeDist(ray, null, poses, registered, hit_radius, 0.0);
+}
+
+pub fn pickCameraExcludingEye(
+    ray: Ray,
+    eye: Vec3,
+    poses: []const CameraPose,
+    registered: []const bool,
+    hit_radius: f64,
+    min_eye_dist: f64,
+) ?usize {
+    return pickCameraWithMinEyeDist(ray, eye, poses, registered, hit_radius, min_eye_dist);
 }
 
 pub const UiButton = struct {
@@ -527,4 +801,116 @@ test "fitImageToMargins and buildProjectionFromKWithFit frame exact image bounds
         try std.testing.expectApproxEqAbs(@as(f64, fit.x) + @as(f64, fit.w), sx_br, 1e-3);
         try std.testing.expectApproxEqAbs(@as(f64, fit.y) + @as(f64, fit.h), sy_br, 1e-3);
     }
+}
+
+test "FirstPersonFrame matches clicked camera pose, rotates in place, and moves along rotated axes" {
+    const r0 = lie.so3Exp(Vec3.init(0.18, -0.45, 0.12));
+    const cam0 = CameraPose{ .r = r0, .t = Vec3.init(1.2, -0.7, 3.4) };
+    var fp = FirstPersonFrame.fromPose(cam0);
+
+    const p0 = fp.toPose();
+    for (0..3) |ri| {
+        for (0..3) |ci| {
+            try std.testing.expectApproxEqAbs(cam0.r.m[ri][ci], p0.r.m[ri][ci], 1e-12);
+        }
+    }
+    const c0 = cam0.cameraCenter();
+    const pc0 = p0.cameraCenter();
+    try std.testing.expectApproxEqAbs(c0.x, pc0.x, 1e-12);
+    try std.testing.expectApproxEqAbs(c0.y, pc0.y, 1e-12);
+    try std.testing.expectApproxEqAbs(c0.z, pc0.z, 1e-12);
+
+    // Pure rotation keeps optical center fixed while rotating forward toward camera right/down
+    const ax0 = cameraAxes(cam0);
+    fp.rotate(std.math.pi * 0.5, 0.0);
+    const p_rot = fp.toPose();
+    const pc_rot = p_rot.cameraCenter();
+    try std.testing.expectApproxEqAbs(c0.x, pc_rot.x, 1e-10);
+    try std.testing.expectApproxEqAbs(c0.y, pc_rot.y, 1e-10);
+    try std.testing.expectApproxEqAbs(c0.z, pc_rot.z, 1e-10);
+
+    const ax_rot = cameraAxes(p_rot);
+    try std.testing.expectApproxEqAbs(ax0.right.x, ax_rot.fwd.x, 1e-10);
+    try std.testing.expectApproxEqAbs(ax0.right.y, ax_rot.fwd.y, 1e-10);
+    try std.testing.expectApproxEqAbs(ax0.right.z, ax_rot.fwd.z, 1e-10);
+    try std.testing.expectApproxEqAbs(1.0, p_rot.r.det(), 1e-10);
+
+    // Displacement moves along the current rotated frame rather than base frame
+    fp.moveLocal(0.0, 0.0, 2.0);
+    const expected_eye = c0.add(ax0.right.scale(2.0));
+    const pc_moved = fp.toPose().cameraCenter();
+    try std.testing.expectApproxEqAbs(expected_eye.x, pc_moved.x, 1e-10);
+    try std.testing.expectApproxEqAbs(expected_eye.y, pc_moved.y, 1e-10);
+    try std.testing.expectApproxEqAbs(expected_eye.z, pc_moved.z, 1e-10);
+}
+
+test "pickCameraExcludingEye ignores the occupied camera and selects cameras ahead" {
+    const k = Mat3{ .m = .{
+        .{ 800.0, 0.0, 400.0 },
+        .{ 0.0, 800.0, 300.0 },
+        .{ 0.0, 0.0, 1.0 },
+    } };
+    const cam_self = CameraPose.identity;
+    const cam_ahead = CameraPose{ .r = Mat3.identity, .t = Vec3.init(0.0, 0.0, -4.0) };
+    const poses = [_]CameraPose{ cam_self, cam_ahead };
+    const reg = [_]bool{ true, true };
+
+    const proj = buildProjectionFromK(k, 800.0, 600.0, 800.0, 600.0, 0.08, 100.0);
+    const view = poseToViewMatrix(cam_self);
+    const ray_center = screenPointToRay(400.0, 300.0, 800.0, 600.0, proj, view).?;
+    const ray_sky = screenPointToRay(10.0, 10.0, 800.0, 600.0, proj, view).?;
+
+    // Standard pickCamera would self-hit cam_self at t1 = hit_radius - near_z
+    try std.testing.expectEqual(@as(?usize, 1), pickCameraExcludingEye(ray_center, cam_self.cameraCenter(), &poses, &reg, 0.35, 0.35));
+    try std.testing.expectEqual(@as(?usize, null), pickCameraExcludingEye(ray_sky, cam_self.cameraCenter(), &poses, &reg, 0.35, 0.35));
+}
+
+test "ViewerController switches to camera FirstPerson model and rotates/displaces without snapping back" {
+    const pts = [_]Vec3{Vec3.init(0, 0, 5)};
+    const cam0 = CameraPose{ .r = Mat3.identity, .t = Vec3.init(0.0, 0.0, 0.0) };
+    const cam1 = CameraPose{
+        .r = lie.so3Exp(Vec3.init(0.05, -0.5, 0.1)),
+        .t = Vec3.init(-2.0, 0.3, -1.5),
+    };
+    const cams = [_]CameraPose{ cam0, cam1 };
+    var ctrl = ViewerController.init(&pts, &cams, 0.8);
+    try std.testing.expectEqual(ViewMode.orbit, ctrl.mode);
+    const orbit_pose0 = ctrl.current_pose;
+
+    ctrl.enterCamera(1, cam1);
+    try std.testing.expectEqual(ViewMode.camera, ctrl.mode);
+    try std.testing.expectEqual(@as(?usize, 1), ctrl.active_cam);
+    ctrl.tick(0.35);
+
+    const c1 = cam1.cameraCenter();
+    const landed = ctrl.current_pose.cameraCenter();
+    try std.testing.expectApproxEqAbs(c1.x, landed.x, 1e-9);
+    try std.testing.expectApproxEqAbs(c1.y, landed.y, 1e-9);
+    try std.testing.expectApproxEqAbs(c1.z, landed.z, 1e-9);
+
+    // Drag-rotating after clicking cam1 stays in camera mode (no snap back to orbit_pose0) and rotates in place
+    ctrl.overlay_mode = 2;
+    ctrl.rotateDrag(120.0, -30.0);
+    try std.testing.expectEqual(ViewMode.camera, ctrl.mode);
+    try std.testing.expect(ctrl.cam_modified);
+    try std.testing.expectEqual(@as(u8, 0), ctrl.overlay_mode);
+    const after_rot = ctrl.current_pose;
+    try std.testing.expectApproxEqAbs(c1.x, after_rot.cameraCenter().x, 1e-9);
+    try std.testing.expectApproxEqAbs(c1.y, after_rot.cameraCenter().y, 1e-9);
+    try std.testing.expectApproxEqAbs(c1.z, after_rot.cameraCenter().z, 1e-9);
+    try std.testing.expect(after_rot.cameraCenter().sub(orbit_pose0.cameraCenter()).norm() > 0.5);
+
+    // WASD forward moves strictly along the newly rotated forward axis of cam1
+    const rotated_ax = cameraAxes(after_rot);
+    ctrl.moveWasd(0.0, 0.0, 1.5);
+    const moved_c = ctrl.current_pose.cameraCenter();
+    const expected_c = c1.add(rotated_ax.fwd.scale(1.5));
+    try std.testing.expectApproxEqAbs(expected_c.x, moved_c.x, 1e-9);
+    try std.testing.expectApproxEqAbs(expected_c.y, moved_c.y, 1e-9);
+    try std.testing.expectApproxEqAbs(expected_c.z, moved_c.z, 1e-9);
+
+    // Returning to orbit restores orbit mode
+    ctrl.enterOrbit();
+    try std.testing.expectEqual(ViewMode.orbit, ctrl.mode);
+    try std.testing.expectEqual(@as(?usize, null), ctrl.active_cam);
 }

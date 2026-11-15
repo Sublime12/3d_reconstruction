@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const sfm = @import("simple_3d_reconstruction");
+const sfm = @import("3d_reconstruction");
 const vm = sfm.viewer_math;
 const Vec3 = sfm.vec.Vec3;
 const CameraPose = sfm.lie.CameraPose;
@@ -451,7 +451,7 @@ pub fn main(init: std.process.Init) !void {
     c.glfwWindowHint(c.GLFW_OPENGL_PROFILE, c.GLFW_OPENGL_CORE_PROFILE);
     c.glfwWindowHint(c.GLFW_SAMPLES, 4);
 
-    const window = c.glfwCreateWindow(1280, 800, "Simple 3D Reconstruction - Interactive Camera Viewer", null, null) orelse
+    const window = c.glfwCreateWindow(1280, 800, "3D Reconstruction - Interactive Camera Viewer", null, null) orelse
         return error.WindowCreateFailed;
     defer c.glfwDestroyWindow(window);
 
@@ -582,19 +582,9 @@ pub fn main(init: std.process.Init) !void {
     const frustum_depth = cam_spacing * 0.42;
     const hit_radius = cam_spacing * 0.34;
 
-    var orbit = vm.OrbitFrame.fromScene(scene.points, cam_poses);
-    var active_cam: ?usize = null;
+    var ctrl = vm.ViewerController.init(scene.points, cam_poses, cam_spacing);
     var hover_cam: ?usize = null;
-
-    var overlay_mode: u8 = 0; // 0 = off, 1 = 50% blend, 2 = 100% real photo
     var show_pip: bool = true;
-
-    // Smooth transition between current pose and clicked camera
-    var anim_active = false;
-    var anim_t: f64 = 1.0;
-    var anim_from_pose: CameraPose = orbit.toPose();
-    var anim_to_pose: CameraPose = orbit.toPose();
-    var current_pose: CameraPose = orbit.toPose();
 
     var gizmo_lines: std.ArrayList(Vertex3D) = .empty;
     defer gizmo_lines.deinit(gpa);
@@ -612,6 +602,8 @@ pub fn main(init: std.process.Init) !void {
     var last_mx: f64 = 0;
     var last_my: f64 = 0;
     var dragged = false;
+    var press_over_ui = false;
+    var press_right_over_ui = false;
 
     var prev_key_f = false;
     var prev_key_r = false;
@@ -654,7 +646,7 @@ pub fn main(init: std.process.Init) !void {
             .w = 136,
             .h = 30,
             .label = "FREE ORBIT (F)",
-            .active = active_cam == null,
+            .active = ctrl.mode == .orbit,
         });
 
         var bx: f32 = 162;
@@ -668,14 +660,14 @@ pub fn main(init: std.process.Init) !void {
                 .w = 34,
                 .h = 30,
                 .label = lbl,
-                .active = active_cam == cam_idx,
+                .active = ctrl.active_cam == cam_idx,
             });
             bx += 40;
         }
 
-        if (active_cam) |ac| {
+        if (ctrl.active_cam) |ac| {
             if (has_photo[ac]) {
-                const ov_lbl: []const u8 = switch (overlay_mode) {
+                const ov_lbl: []const u8 = switch (ctrl.overlay_mode) {
                     0 => "OVERLAY: OFF (R)",
                     1 => "OVERLAY: 50% (R)",
                     else => "OVERLAY: 100% (R)",
@@ -687,7 +679,7 @@ pub fn main(init: std.process.Init) !void {
                     .w = 156,
                     .h = 28,
                     .label = ov_lbl,
-                    .active = overlay_mode > 0,
+                    .active = ctrl.overlay_mode > 0 and !ctrl.cam_modified,
                 });
                 try ui_buttons.append(gpa, .{
                     .id = -3,
@@ -709,14 +701,15 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        const pick_fit = computePhotoFit(win_w, win_h, img_w, img_h, active_cam != null);
+        const pick_fit = computePhotoFit(win_w, win_h, img_w, img_h, ctrl.mode == .camera);
         const pick_proj = vm.buildProjectionFromKWithFit(k, pick_fit, win_w, win_h, 0.08, 250.0);
-        const view = vm.poseToViewMatrix(current_pose);
+        const view = vm.poseToViewMatrix(ctrl.current_pose);
+        const viewer_eye = ctrl.current_pose.cameraCenter();
 
         hover_cam = null;
         if (!over_ui and cam_count > 0) {
             if (vm.screenPointToRay(mx, my, win_w, win_h, pick_proj, view)) |ray| {
-                hover_cam = vm.pickCamera(ray, cam_poses, cam_reg, hit_radius);
+                hover_cam = vm.pickCameraExcludingEye(ray, viewer_eye, cam_poses, cam_reg, hit_radius, hit_radius);
             }
         }
 
@@ -724,22 +717,18 @@ pub fn main(init: std.process.Init) !void {
         const key_f = c.glfwGetKey(window, c.GLFW_KEY_F) == c.GLFW_PRESS or
             c.glfwGetKey(window, c.GLFW_KEY_ESCAPE) == c.GLFW_PRESS;
         if (key_f and !prev_key_f) {
-            active_cam = null;
-            anim_active = true;
-            anim_t = 0.0;
-            anim_from_pose = current_pose;
-            anim_to_pose = orbit.toPose();
+            ctrl.enterOrbit();
         }
         prev_key_f = key_f;
 
         const key_r = c.glfwGetKey(window, c.GLFW_KEY_R) == c.GLFW_PRESS;
-        if (key_r and !prev_key_r and active_cam != null) {
-            overlay_mode = (overlay_mode + 1) % 3;
+        if (key_r and !prev_key_r and ctrl.active_cam != null) {
+            ctrl.toggleOverlay(cam_poses);
         }
         prev_key_r = key_r;
 
         const key_p = c.glfwGetKey(window, c.GLFW_KEY_P) == c.GLFW_PRESS;
-        if (key_p and !prev_key_p and active_cam != null) {
+        if (key_p and !prev_key_p and ctrl.active_cam != null) {
             show_pip = !show_pip;
         }
         prev_key_p = key_p;
@@ -749,23 +738,35 @@ pub fn main(init: std.process.Init) !void {
         if (cam_count > 0 and ((key_left and !prev_key_left) or (key_right and !prev_key_right))) {
             const step: isize = if (key_left and !prev_key_left) -1 else 1;
             const n_imgs: isize = @intCast(cam_count);
-            var next_idx: isize = if (active_cam) |ac| @as(isize, @intCast(ac)) else if (step > 0) -1 else 0;
+            var next_idx: isize = if (ctrl.active_cam) |ac| @as(isize, @intCast(ac)) else if (step > 0) -1 else 0;
             var tries: usize = 0;
             while (tries < cam_count) : (tries += 1) {
                 next_idx = @mod(next_idx + step, n_imgs);
                 const ui_idx: usize = @intCast(next_idx);
                 if (cam_reg[ui_idx]) {
-                    active_cam = ui_idx;
-                    anim_active = true;
-                    anim_t = 0.0;
-                    anim_from_pose = current_pose;
-                    anim_to_pose = cam_poses[ui_idx];
+                    ctrl.enterCamera(ui_idx, cam_poses[ui_idx]);
                     break;
                 }
             }
         }
         prev_key_left = key_left;
         prev_key_right = key_right;
+
+        // WASD/QE camera-local displacement
+        var d_right: f64 = 0.0;
+        var d_up: f64 = 0.0;
+        var d_fwd: f64 = 0.0;
+        if (c.glfwGetKey(window, c.GLFW_KEY_D) == c.GLFW_PRESS) d_right += 1.0;
+        if (c.glfwGetKey(window, c.GLFW_KEY_A) == c.GLFW_PRESS) d_right -= 1.0;
+        if (c.glfwGetKey(window, c.GLFW_KEY_E) == c.GLFW_PRESS) d_up += 1.0;
+        if (c.glfwGetKey(window, c.GLFW_KEY_Q) == c.GLFW_PRESS) d_up -= 1.0;
+        if (c.glfwGetKey(window, c.GLFW_KEY_W) == c.GLFW_PRESS) d_fwd += 1.0;
+        if (c.glfwGetKey(window, c.GLFW_KEY_S) == c.GLFW_PRESS) d_fwd -= 1.0;
+        const move_norm = @sqrt(d_right * d_right + d_up * d_up + d_fwd * d_fwd);
+        if (move_norm > 0.0) {
+            const move_step = dt * @max(0.5, cam_spacing * 2.5) / move_norm;
+            ctrl.moveWasd(d_right * move_step, d_up * move_step, d_fwd * move_step);
+        }
 
         // Mouse input
         const left_down = c.glfwGetMouseButton(window, c.GLFW_MOUSE_BUTTON_LEFT) == c.GLFW_PRESS;
@@ -777,6 +778,10 @@ pub fn main(init: std.process.Init) !void {
             press_mx = mx;
             press_my = my;
             dragged = false;
+            press_over_ui = over_ui;
+        }
+        if (right_down and !prev_right) {
+            press_right_over_ui = over_ui;
         }
 
         if (left_down and prev_left) {
@@ -785,33 +790,20 @@ pub fn main(init: std.process.Init) !void {
             if (@abs(mx - press_mx) > 5.0 or @abs(my - press_my) > 5.0) {
                 dragged = true;
             }
-            if (dragged and !over_ui) {
-                if (active_cam != null) {
-                    active_cam = null;
-                    anim_active = false;
-                } else {
-                    anim_active = false;
-                }
+            if (dragged and !press_over_ui) {
                 if (shift_down) {
-                    orbit.pan(dx / win_w, dy / win_h);
+                    ctrl.panDrag(dx / win_w, dy / win_h);
                 } else {
-                    orbit.yaw += dx * 0.006;
-                    orbit.pitch = std.math.clamp(orbit.pitch + dy * 0.006, -1.45, 1.45);
+                    ctrl.rotateDrag(dx, dy);
                 }
-                current_pose = orbit.toPose();
             }
         }
 
-        if (right_down and prev_right) {
+        if (right_down and prev_right and !press_right_over_ui) {
             const dx = mx - last_mx;
             const dy = my - last_my;
             if (@abs(dx) > 0.1 or @abs(dy) > 0.1) {
-                if (active_cam != null) {
-                    active_cam = null;
-                    anim_active = false;
-                }
-                orbit.pan(dx / win_w, dy / win_h);
-                current_pose = orbit.toPose();
+                ctrl.panDrag(dx / win_w, dy / win_h);
             }
         }
 
@@ -822,22 +814,14 @@ pub fn main(init: std.process.Init) !void {
                 if (btn.contains(mx, my)) {
                     handled = true;
                     if (btn.id == -1) {
-                        active_cam = null;
-                        anim_active = true;
-                        anim_t = 0.0;
-                        anim_from_pose = current_pose;
-                        anim_to_pose = orbit.toPose();
+                        ctrl.enterOrbit();
                     } else if (btn.id == -2) {
-                        overlay_mode = (overlay_mode + 1) % 3;
+                        ctrl.toggleOverlay(cam_poses);
                     } else if (btn.id == -3) {
                         show_pip = !show_pip;
                     } else if (btn.id >= 0) {
                         const cam_idx: usize = @intCast(btn.id);
-                        active_cam = cam_idx;
-                        anim_active = true;
-                        anim_t = 0.0;
-                        anim_from_pose = current_pose;
-                        anim_to_pose = cam_poses[cam_idx];
+                        ctrl.enterCamera(cam_idx, cam_poses[cam_idx]);
                     }
                     break;
                 }
@@ -845,23 +829,13 @@ pub fn main(init: std.process.Init) !void {
 
             if (!handled) {
                 if (hover_cam) |cam_idx| {
-                    active_cam = cam_idx;
-                    anim_active = true;
-                    anim_t = 0.0;
-                    anim_from_pose = current_pose;
-                    anim_to_pose = cam_poses[cam_idx];
+                    ctrl.enterCamera(cam_idx, cam_poses[cam_idx]);
                 }
             }
         }
 
         if (g_scroll_y != 0.0) {
-            if (active_cam != null) {
-                active_cam = null;
-                anim_active = false;
-            }
-            const zoom_factor = std.math.pow(f64, 0.88, g_scroll_y);
-            orbit.dist = std.math.clamp(orbit.dist * zoom_factor, 0.3, 80.0);
-            current_pose = orbit.toPose();
+            ctrl.scrollMove(g_scroll_y);
             g_scroll_y = 0.0;
         }
 
@@ -870,22 +844,10 @@ pub fn main(init: std.process.Init) !void {
         last_mx = mx;
         last_my = my;
 
-        if (anim_active) {
-            anim_t = @min(1.0, anim_t + dt / 0.35);
-            const ease = 1.0 - std.math.pow(f64, 1.0 - anim_t, 3.0);
-            current_pose = sfm.render.interpolatePose(anim_from_pose, anim_to_pose, ease);
-            if (anim_t >= 1.0) {
-                anim_active = false;
-                current_pose = anim_to_pose;
-            }
-        } else if (active_cam) |ac| {
-            current_pose = cam_poses[ac];
-        } else {
-            current_pose = orbit.toPose();
-        }
+        ctrl.tick(dt);
 
         // Render frame
-        const fit = computePhotoFit(win_w, win_h, img_w, img_h, active_cam != null);
+        const fit = computePhotoFit(win_w, win_h, img_w, img_h, ctrl.mode == .camera);
         const proj = vm.buildProjectionFromKWithFit(k, fit, win_w, win_h, 0.08, 250.0);
 
         c.glViewport(0, 0, fb_w_i, fb_h_i);
@@ -895,7 +857,7 @@ pub fn main(init: std.process.Init) !void {
         c.glEnable(c.GL_DEPTH_TEST);
         c.glDisable(c.GL_CULL_FACE);
 
-        const mvp = proj.mul(vm.poseToViewMatrix(current_pose));
+        const mvp = proj.mul(vm.poseToViewMatrix(ctrl.current_pose));
         c.glUseProgram(prog_3d);
         c.glUniformMatrix4fv(u_mvp_loc, 1, c.GL_FALSE, &mvp.m);
 
@@ -903,17 +865,19 @@ pub fn main(init: std.process.Init) !void {
         c.glBindVertexArray(mesh_vao);
         c.glDrawElements(c.GL_TRIANGLES, @intCast(mesh_indices.len), c.GL_UNSIGNED_INT, null);
 
-        // Build & draw camera frustums + markers (hide the active camera's own gizmo while inside it)
+        // Build & draw camera frustums + markers (hide gizmos surrounding the viewer eye)
         gizmo_lines.clearRetainingCapacity();
         gizmo_tris.clearRetainingCapacity();
+        const render_eye = ctrl.current_pose.cameraCenter();
+        const gizmo_hide_r = frustum_depth * 0.35;
         for (cam_poses, cam_reg, 0..) |p, is_reg, cam_idx| {
             if (!is_reg) continue;
-            if (active_cam == cam_idx and !anim_active) continue;
+            if (p.cameraCenter().sub(render_eye).norm() < gizmo_hide_r) continue;
 
             const is_hover = hover_cam == cam_idx;
             const line_col: [3]f32 = if (is_hover)
                 .{ 1.0, 0.90, 0.20 }
-            else if (active_cam == cam_idx)
+            else if (ctrl.active_cam == cam_idx)
                 .{ 0.20, 0.85, 1.0 }
             else
                 .{ 0.20, 0.92, 0.45 };
@@ -964,9 +928,10 @@ pub fn main(init: std.process.Init) !void {
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
 
         // Optional real photo overlay directly aligned with the active camera projection
-        if (active_cam) |ac| {
-            if (has_photo[ac] and overlay_mode > 0) {
-                const alpha: f32 = if (overlay_mode == 1) 0.5 else 1.0;
+        if (ctrl.shouldDrawPhotoOverlay()) {
+            const ac = ctrl.active_cam.?;
+            if (has_photo[ac]) {
+                const alpha: f32 = if (ctrl.overlay_mode == 1) 0.5 else 1.0;
                 c.glUseProgram(prog_2d_tex);
                 c.glBindVertexArray(tex_vao);
                 drawTexturedQuad(tex_vbo, fit.x, fit.y, fit.w, fit.h, win_wf, win_hf, cam_textures[ac], alpha, u_tex_loc, u_alpha_loc);
@@ -975,7 +940,7 @@ pub fn main(init: std.process.Init) !void {
 
         // Draw HUD panels & buttons
         ui_batch.clear();
-        if (active_cam != null) {
+        if (ctrl.mode == .camera and !ctrl.cam_modified) {
             try ui_batch.addRectBorder(
                 gpa,
                 fit.x - 1.5,
@@ -988,7 +953,7 @@ pub fn main(init: std.process.Init) !void {
                 .{ 0.25, 0.78, 1.0, 0.85 },
             );
         }
-        try ui_batch.addRect(gpa, 0, 0, win_wf, if (active_cam != null) 88 else 56, win_wf, win_hf, .{ 0.05, 0.06, 0.08, 0.78 });
+        try ui_batch.addRect(gpa, 0, 0, win_wf, if (ctrl.mode == .camera) 88 else 56, win_wf, win_hf, .{ 0.05, 0.06, 0.08, 0.78 });
 
         for (ui_buttons.items) |btn| {
             const hovered = btn.contains(mx, my);
@@ -1019,15 +984,18 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // Bottom status strip
-        const status = if (active_cam) |ac|
-            try std.fmt.allocPrint(arena, "CAMERA {d:02} VIEW ({s}) | LEFT/RIGHT: SWITCH | R: PHOTO OVERLAY | F/DRAG: FREE ORBIT", .{ ac, std.fs.path.basename(scene.cameras[ac].image_path) })
+        const status = if (ctrl.active_cam) |ac|
+            if (ctrl.cam_modified)
+                try std.fmt.allocPrint(arena, "CAMERA {d:02} FREE MOVE | CLICK {d:02}: RESET | DRAG: LOOK | WASD/SCROLL/R-DRAG: MOVE | F: ORBIT", .{ ac, ac })
+            else
+                try std.fmt.allocPrint(arena, "CAMERA {d:02} VIEW ({s}) | DRAG: LOOK | WASD/SCROLL/R-DRAG: MOVE | R: OVERLAY | F: ORBIT", .{ ac, std.fs.path.basename(scene.cameras[ac].image_path) })
         else
-            "FREE ORBIT | CLICK ANY GREEN CAMERA OR TOP BUTTON TO ENTER ITS VIEW | DRAG: ORBIT | RIGHT-DRAG: PAN | SCROLL: ZOOM";
+            "FREE ORBIT | CLICK CAMERA: ENTER FPS VIEW | DRAG: ORBIT | R-DRAG: PAN | WASD/SCROLL: MOVE";
         try ui_batch.addRect(gpa, 0, win_hf - 28, win_wf, 28, win_wf, win_hf, .{ 0.05, 0.06, 0.08, 0.80 });
         try ui_batch.addText(gpa, 14, win_hf - 19, 1.5, status, win_wf, win_hf, .{ 0.85, 0.89, 0.95, 1.0 });
 
         // PiP card border & label if active camera + show_pip
-        const pip_rect: ?PipRect = if (active_cam) |ac|
+        const pip_rect: ?PipRect = if (ctrl.active_cam) |ac|
             if (has_photo[ac] and show_pip) computePipRect(win_wf, win_hf, img_w, img_h) else null
         else
             null;
@@ -1053,7 +1021,7 @@ pub fn main(init: std.process.Init) !void {
 
         // Draw real photo PiP thumbnail inside card
         if (pip_rect) |pip| {
-            const ac = active_cam.?;
+            const ac = ctrl.active_cam.?;
             c.glUseProgram(prog_2d_tex);
             c.glBindVertexArray(tex_vao);
             drawTexturedQuad(tex_vbo, pip.x, pip.y, pip.w, pip.h, win_wf, win_hf, cam_textures[ac], 1.0, u_tex_loc, u_alpha_loc);

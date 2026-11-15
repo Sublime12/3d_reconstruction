@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     translate_ort.addIncludePath(b.path("third_party/onnxruntime/include"));
     const c_ort_mod = translate_ort.createModule();
 
-    const mod = b.addModule("simple_3d_reconstruction", .{
+    const mod = b.addModule("3d_reconstruction", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .link_libc = true,
@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
-        .name = "simple_3d_reconstruction",
+        .name = "3d_reconstruction",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -102,12 +102,12 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "simple_3d_reconstruction" is the name you will use in your source code to
-                // import this module (e.g. `@import("simple_3d_reconstruction")`). The name is
+                // Here "3d_reconstruction" is the name you will use in your source code to
+                // import this module (e.g. `@import("3d_reconstruction")`). The name is
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "simple_3d_reconstruction", .module = mod },
+                .{ .name = "3d_reconstruction", .module = mod },
             },
         }),
     });
@@ -176,7 +176,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "simple_3d_reconstruction", .module = mod },
+                .{ .name = "3d_reconstruction", .module = mod },
             },
         }),
     });
@@ -199,7 +199,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "simple_3d_reconstruction", .module = mod },
+                .{ .name = "3d_reconstruction", .module = mod },
                 .{ .name = "c_gl", .module = c_gl_mod },
             },
         }),
