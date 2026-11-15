@@ -13,6 +13,8 @@ pub fn main(init: std.process.Init) !void {
     var out_path: []const u8 = "output/reconstruction.ply";
     var max_dim: u32 = 1200;
     var num_threads: usize = 1;
+    var enable_dense: bool = false;
+    var dense_stride: u32 = 3;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -28,9 +30,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
             i += 1;
             num_threads = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--dense")) {
+            enable_dense = true;
+        } else if (std.mem.eql(u8, args[i], "--dense-stride") and i + 1 < args.len) {
+            i += 1;
+            dense_stride = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             std.debug.print(
-                "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>]\n",
+                "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--dense] [--dense-stride <n>]\n",
                 .{},
             );
             return;
@@ -105,7 +112,27 @@ pub fn main(init: std.process.Init) !void {
         if (is_reg) try reg_poses.append(gpa, p);
     }
 
-    const ply_bytes = try sfm.io_ply.formatPly(gpa, result.points, result.colors, reg_poses.items);
+    var out_points: []const sfm.vec.Vec3 = result.points;
+    var out_colors: []const sfm.io_ply.Color = result.colors;
+    var dense_cloud: ?sfm.dense.DenseCloud = null;
+    defer if (dense_cloud) |*dc| dc.deinit(gpa);
+
+    if (enable_dense) {
+        std.log.info("Running Dense MVS (ZNCC, stride={d})...", .{dense_stride});
+        dense_cloud = try sfm.dense.runDenseMvs(
+            gpa,
+            k,
+            images,
+            result.poses,
+            result.registered,
+            result.points,
+            .{ .stride = dense_stride, .num_threads = num_threads },
+        );
+        out_points = dense_cloud.?.points;
+        out_colors = dense_cloud.?.colors;
+    }
+
+    const ply_bytes = try sfm.io_ply.formatPly(gpa, out_points, out_colors, reg_poses.items);
     defer gpa.free(ply_bytes);
 
     if (std.fs.path.dirname(out_path)) |parent| {
@@ -113,9 +140,11 @@ pub fn main(init: std.process.Init) !void {
     }
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = ply_bytes });
 
+    const total_elapsed_ns = t_start.durationTo(Io.Clock.now(.awake, io)).nanoseconds;
+    const total_elapsed_ms = @as(f64, @floatFromInt(total_elapsed_ns)) / 1e6;
     std.log.info(
-        "Done in {d:.1} ms! Registered {d}/{d} cameras, {d} 3D points, mean reproj error = {d:.3} px -> {s}",
-        .{ elapsed_ms, result.registered_count, images.len, result.points.len, result.mean_reproj_err, out_path },
+        "Done in {d:.1} ms (SfM {d:.1} ms)! Registered {d}/{d} cameras, {d} 3D points, mean reproj error = {d:.3} px -> {s}",
+        .{ total_elapsed_ms, elapsed_ms, result.registered_count, images.len, out_points.len, result.mean_reproj_err, out_path },
     );
 }
 

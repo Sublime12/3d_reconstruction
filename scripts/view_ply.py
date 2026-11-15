@@ -45,6 +45,7 @@ def main():
 
     (xs, ys, zs, colors), (cxs, cys, czs) = load_ply_ascii(args.ply)
 
+    pt_size = 1.5 if len(xs) > 20000 else 3.0
     fig = go.Figure()
     fig.add_trace(
         go.Scatter3d(
@@ -53,7 +54,7 @@ def main():
             z=zs,
             mode="markers",
             name="3D Points",
-            marker=dict(size=3.0, color=colors),
+            marker=dict(size=pt_size, color=colors),
         )
     )
     if cxs:
