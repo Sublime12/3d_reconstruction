@@ -4,3 +4,9 @@ data/
 output/
 __pycache__/
 third_party/wgpu-native/lib/
+third_party/wgpu-native/wgpu-native-meta/
+third_party/onnxruntime/*
+!third_party/onnxruntime/include/
+!third_party/onnxruntime/LICENSE
+!third_party/onnxruntime/VERSION_NUMBER
+models/

@@ -16,6 +16,7 @@ pub const dense = @import("dense.zig");
 pub const render = @import("render.zig");
 pub const viewer_math = @import("viewer_math.zig");
 pub const gpu = @import("gpu.zig");
+pub const neural_depth = @import("neural_depth.zig");
 
 pub const CliOptions = struct {
     data_dir: []const u8 = "data/fountain-p11",
@@ -23,6 +24,7 @@ pub const CliOptions = struct {
     max_dim: u32 = 1200,
     num_threads: usize = 1,
     use_gpu: bool = false,
+    nn_model_path: ?[]const u8 = null,
     verify_views_dir: ?[]const u8 = null,
     show_help: bool = false,
 };
@@ -45,6 +47,9 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             opts.num_threads = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--gpu")) {
             opts.use_gpu = true;
+        } else if (std.mem.eql(u8, args[i], "--nn-model") and i + 1 < args.len) {
+            i += 1;
+            opts.nn_model_path = args[i];
         } else if (std.mem.eql(u8, args[i], "--verify-views") and i + 1 < args.len) {
             i += 1;
             opts.verify_views_dir = args[i];
@@ -67,6 +72,8 @@ test "parseCliArgs parses flags" {
         "--threads",
         "4",
         "--gpu",
+        "--nn-model",
+        "models/moge-2-vitb-normal.onnx",
         "--verify-views",
         "output/views",
     };
@@ -76,6 +83,7 @@ test "parseCliArgs parses flags" {
     try std.testing.expectEqual(@as(u32, 800), opts.max_dim);
     try std.testing.expectEqual(@as(usize, 4), opts.num_threads);
     try std.testing.expect(opts.use_gpu);
+    try std.testing.expectEqualStrings("models/moge-2-vitb-normal.onnx", opts.nn_model_path.?);
     try std.testing.expectEqualStrings("output/views", opts.verify_views_dir.?);
     try std.testing.expect(!opts.show_help);
 }

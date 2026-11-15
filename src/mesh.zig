@@ -6,6 +6,7 @@ const lie = @import("math/lie.zig");
 const CameraPose = lie.CameraPose;
 const dataset = @import("dataset.zig");
 const Color = @import("io_ply.zig").Color;
+const render = @import("render.zig");
 
 pub const Triangle = [3]usize;
 
@@ -129,6 +130,34 @@ pub fn buildColoredMesh(
     }
     std.mem.sort(f64, edge_lens.items, {}, std.sort.asc(f64));
     const med_edge = if (edge_lens.items.len > 0) edge_lens.items[edge_lens.items.len / 2] else 1.0;
+
+    var faces = try filterDelaunayFaces(allocator, mesh_pts, raw_faces, basis.forward, med_edge, config);
+    errdefer faces.deinit(allocator);
+
+    if (config.fill_holes and faces.items.len > 0) {
+        try fillInteriorHoles(allocator, mesh_pts, pts2d, basis, &faces, med_edge, config);
+    }
+
+    const out_faces = try faces.toOwnedSlice(allocator);
+    if (config.laplacian_iters > 0 and out_faces.len > 0) {
+        try smoothMeshVertices(allocator, mesh_pts, out_faces, config.laplacian_iters, 0.4);
+    }
+
+    return .{
+        .points = mesh_pts,
+        .colors = mesh_cols,
+        .faces = out_faces,
+    };
+}
+
+fn filterDelaunayFaces(
+    allocator: std.mem.Allocator,
+    mesh_pts: []const Vec3,
+    raw_faces: []const Triangle,
+    view_forward: Vec3,
+    med_edge: f64,
+    config: MeshConfig,
+) !std.ArrayList(Triangle) {
     const max_edge = @max(med_edge * config.max_edge_factor, 1e-6);
     const max_edge_sq = max_edge * max_edge;
 
@@ -153,31 +182,16 @@ pub fn buildColoredMesh(
         if (area2 < 1e-12) continue;
 
         const n_unit = cross_n.scale(1.0 / area2);
-        const view_cos = n_unit.dot(basis.forward);
+        const view_cos = n_unit.dot(view_forward);
         if (@abs(view_cos) < config.min_view_cos) continue;
 
-        // Orient winding so normal faces toward cameras (-forward)
         if (view_cos > 0) {
             try faces.append(allocator, .{ tri[0], tri[2], tri[1] });
         } else {
             try faces.append(allocator, tri);
         }
     }
-
-    if (config.fill_holes and faces.items.len > 0) {
-        try fillInteriorHoles(allocator, mesh_pts, pts2d, basis, &faces, med_edge, config);
-    }
-
-    const out_faces = try faces.toOwnedSlice(allocator);
-    if (config.laplacian_iters > 0 and out_faces.len > 0) {
-        try smoothMeshVertices(allocator, mesh_pts, out_faces, config.laplacian_iters, 0.4);
-    }
-
-    return .{
-        .points = mesh_pts,
-        .colors = mesh_cols,
-        .faces = out_faces,
-    };
+    return faces;
 }
 
 /// Close remaining enclosed interior boundary loops on an existing mesh using 2D ear clipping
@@ -1120,19 +1134,38 @@ pub fn subdivideAndProjectTexture(
     defer allocator.free(cam_centers);
     for (poses, 0..) |p, ci| cam_centers[ci] = p.cameraCenter();
 
-    // Project every vertex onto the best-facing registered photo to sample RGB color
+    // Project every vertex onto the best-facing, visibility-consistent registered photo
     const new_cols = try allocator.alloc(Color, verts.items.len);
     errdefer allocator.free(new_cols);
+    const has_unocc = try allocator.alloc(bool, verts.items.len);
+    defer allocator.free(has_unocc);
+    @memset(has_unocc, false);
+    const best_scores = try allocator.alloc(f64, verts.items.len);
+    defer allocator.free(best_scores);
+    @memset(best_scores, -1.0);
+    const fallback_scores = try allocator.alloc(f64, verts.items.len);
+    defer allocator.free(fallback_scores);
+    @memset(fallback_scores, -1.0);
+    const fallback_cols = try allocator.alloc(Color, verts.items.len);
+    defer allocator.free(fallback_cols);
 
-    for (verts.items, normals, 0..) |pt, nrm, vi| {
-        var best_score: f64 = -1.0;
-        var best_col: ?Color = null;
+    for (verts.items, 0..) |_, vi| {
+        const init_col: Color = if (vi < mesh.colors.len) mesh.colors[vi] else .{ .r = 160, .g = 160, .b = 160 };
+        new_cols[vi] = init_col;
+        fallback_cols[vi] = init_col;
+    }
 
-        for (images, poses, registered, cam_centers) |img, pose, is_reg, cam_c| {
-            if (!is_reg) continue;
+    for (images, poses, registered, cam_centers) |img, pose, is_reg, cam_c| {
+        if (!is_reg) continue;
+        var vis = try render.renderMeshView(allocator, img.width, img.height, k, pose, mesh.points, mesh.colors, mesh.faces);
+        defer vis.deinit(allocator);
+
+        const wf: f64 = @floatFromInt(img.width);
+        const hf: f64 = @floatFromInt(img.height);
+        for (verts.items, normals, 0..) |pt, nrm, vi| {
+            const p_cam = pose.transformPoint(pt);
+            if (p_cam.z <= 1e-4) continue;
             const uv = lie.projectPoint(k, pose, pt) orelse continue;
-            const wf: f64 = @floatFromInt(img.width);
-            const hf: f64 = @floatFromInt(img.height);
             if (uv.x < 1.0 or uv.x >= wf - 2.0 or uv.y < 1.0 or uv.y >= hf - 2.0) continue;
 
             const ray_to_cam = cam_c.sub(pt).normalize();
@@ -1142,18 +1175,28 @@ pub fn subdivideAndProjectTexture(
             const centrality = @max(0.1, 1.0 - @sqrt(dx * dx + dy * dy));
             const score = cos_view * centrality;
 
-            if (score > best_score) {
-                best_score = score;
-                best_col = sampleBilinearRgb(img, uv.x, uv.y);
+            const px_i: usize = @min(img.width - 1, @as(usize, @intFromFloat(@floor(uv.x))));
+            const py_i: usize = @min(img.height - 1, @as(usize, @intFromFloat(@floor(uv.y))));
+            const p_idx = py_i * img.width + px_i;
+            const occ_tol = @max(0.08, 0.015 * p_cam.z);
+            const is_visible = !vis.covered[p_idx] or (p_cam.z <= @as(f64, vis.depth[p_idx]) + occ_tol);
+
+            if (is_visible) {
+                if (!has_unocc[vi] or score > best_scores[vi]) {
+                    has_unocc[vi] = true;
+                    best_scores[vi] = score;
+                    new_cols[vi] = sampleBilinearRgb(img, uv.x, uv.y);
+                }
+            } else if (!has_unocc[vi] and score > fallback_scores[vi]) {
+                fallback_scores[vi] = score;
+                fallback_cols[vi] = sampleBilinearRgb(img, uv.x, uv.y);
             }
         }
+    }
 
-        if (best_col) |col| {
-            new_cols[vi] = col;
-        } else if (vi < mesh.colors.len) {
-            new_cols[vi] = mesh.colors[vi];
-        } else {
-            new_cols[vi] = .{ .r = 160, .g = 160, .b = 160 };
+    for (0..verts.items.len) |vi| {
+        if (!has_unocc[vi] and fallback_scores[vi] > -0.5) {
+            new_cols[vi] = fallback_cols[vi];
         }
     }
 

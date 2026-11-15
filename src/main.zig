@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const opts = try sfm.parseCliArgs(args);
     if (opts.show_help) {
         std.debug.print(
-            "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--gpu] [--verify-views <dir>]\n",
+            "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--gpu] [--nn-model <onnx>] [--verify-views <dir>]\n",
             .{},
         );
         return;
@@ -113,6 +113,28 @@ pub fn main(init: std.process.Init) !void {
     );
 
     try sfm.mesh.fillMeshInteriorHoles(gpa, &colored_mesh, reg_poses.items, .{});
+
+    if (opts.nn_model_path) |nn_path| {
+        std.log.info("Running 3D Transformer hole completion with '{s}'...", .{nn_path});
+        const t_nn0 = Io.Clock.now(.awake, io);
+        const added_nn = try sfm.neural_depth.completeMeshHolesWithTransformer(
+            gpa,
+            &colored_mesh,
+            k,
+            images,
+            result.poses,
+            result.registered,
+            .{ .model_path = nn_path, .num_threads = num_threads },
+        );
+        const nn_ms = @as(f64, @floatFromInt(t_nn0.durationTo(Io.Clock.now(.awake, io)).nanoseconds)) / 1e6;
+        std.log.info("Transformer added {d} hole vertices in {d:.1} ms -> {d} vertices, {d} triangles", .{
+            added_nn,
+            nn_ms,
+            colored_mesh.points.len,
+            colored_mesh.faces.len,
+        });
+        try sfm.mesh.fillMeshInteriorHoles(gpa, &colored_mesh, reg_poses.items, .{});
+    }
 
     std.log.info("Subdividing mesh and projecting photos onto {d} triangles...", .{colored_mesh.faces.len});
     try sfm.mesh.subdivideAndProjectTexture(

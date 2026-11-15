@@ -43,6 +43,14 @@ pub fn build(b: *std.Build) void {
     translate_wgpu.addIncludePath(b.path("third_party/wgpu-native/include"));
     const c_wgpu_mod = translate_wgpu.createModule();
 
+    const translate_ort = b.addTranslateC(.{
+        .root_source_file = b.path("src/c_ort.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_ort.addIncludePath(b.path("third_party/onnxruntime/include"));
+    const c_ort_mod = translate_ort.createModule();
+
     const mod = b.addModule("simple_3d_reconstruction", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -50,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "c_img", .module = c_img_mod },
             .{ .name = "c_wgpu", .module = c_wgpu_mod },
+            .{ .name = "c_ort", .module = c_ort_mod },
         },
     });
     mod.linkSystemLibrary("png", .{});
@@ -57,6 +66,9 @@ pub fn build(b: *std.Build) void {
     mod.addLibraryPath(b.path("third_party/wgpu-native/lib"));
     mod.addRPath(b.path("third_party/wgpu-native/lib"));
     mod.linkSystemLibrary("wgpu_native", .{});
+    mod.addLibraryPath(b.path("third_party/onnxruntime/lib"));
+    mod.addRPath(b.path("third_party/onnxruntime/lib"));
+    mod.linkSystemLibrary("onnxruntime", .{});
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
