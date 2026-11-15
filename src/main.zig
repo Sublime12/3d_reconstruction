@@ -9,33 +9,18 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
 
-    var data_dir: []const u8 = "data/fountain-p11";
-    var out_path: []const u8 = "output/reconstruction.ply";
-    var max_dim: u32 = 1200;
-    var num_threads: usize = 1;
-
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--data") and i + 1 < args.len) {
-            i += 1;
-            data_dir = args[i];
-        } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
-            i += 1;
-            out_path = args[i];
-        } else if (std.mem.eql(u8, args[i], "--max-dim") and i + 1 < args.len) {
-            i += 1;
-            max_dim = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
-            i += 1;
-            num_threads = try std.fmt.parseInt(usize, args[i], 10);
-        } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
-            std.debug.print(
-                "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>]\n",
-                .{},
-            );
-            return;
-        }
+    const opts = try sfm.parseCliArgs(args);
+    if (opts.show_help) {
+        std.debug.print(
+            "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--verify-views <dir>]\n",
+            .{},
+        );
+        return;
     }
+    const data_dir = opts.data_dir;
+    const out_path = opts.out_path;
+    const max_dim = opts.max_dim;
+    const num_threads = opts.num_threads;
 
     const k_path = try std.fmt.allocPrint(arena, "{s}/K.txt", .{data_dir});
     const k_text = Io.Dir.cwd().readFileAlloc(io, k_path, arena, .limited(64 * 1024)) catch |err| {
@@ -140,6 +125,127 @@ pub fn main(init: std.process.Init) !void {
         "Done in {d:.1} ms (SfM {d:.1} ms)! Registered {d}/{d} cameras, {d} mesh vertices, {d} triangles, mean reproj error = {d:.3} px -> {s}",
         .{ total_elapsed_ms, elapsed_ms, result.registered_count, images.len, colored_mesh.points.len, colored_mesh.faces.len, result.mean_reproj_err, out_path },
     );
+
+    if (opts.verify_views_dir) |verify_dir| {
+        try runVerifyViews(gpa, arena, io, verify_dir, k, images, reg_poses.items, &result, &colored_mesh);
+    }
+}
+
+fn runVerifyViews(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    verify_dir: []const u8,
+    k: sfm.mat.Mat3,
+    images: []const sfm.dataset.ImageData,
+    reg_poses: []const sfm.lie.CameraPose,
+    result: *const sfm.pipeline.SfmResult,
+    colored_mesh: *const sfm.mesh.Mesh,
+) !void {
+    try Io.Dir.cwd().createDirPath(io, verify_dir);
+
+    var cov_sum: f64 = 0.0;
+    var mae_sum: f64 = 0.0;
+    var rmse_sum: f64 = 0.0;
+    var psnr_sum: f64 = 0.0;
+    var ssim_sum: f64 = 0.0;
+    var n_eval: usize = 0;
+
+    for (images, 0..) |img, cam_idx| {
+        if (!result.registered[cam_idx]) continue;
+
+        var ren = try sfm.render.renderMeshView(
+            gpa,
+            img.width,
+            img.height,
+            k,
+            result.poses[cam_idx],
+            colored_mesh.points,
+            colored_mesh.colors,
+            colored_mesh.faces,
+        );
+        defer ren.deinit(gpa);
+
+        const metrics = sfm.render.computeViewMetrics(ren, img);
+        cov_sum += metrics.coverage_ratio;
+        mae_sum += metrics.mae;
+        rmse_sum += metrics.rmse;
+        psnr_sum += metrics.psnr_db;
+        ssim_sum += metrics.ssim;
+        n_eval += 1;
+
+        std.log.info(
+            "Verify cam {d:02}: coverage={d:.1}% MAE={d:.2} RMSE={d:.2} PSNR={d:.2} dB SSIM={d:.4}",
+            .{ cam_idx, metrics.coverage_ratio * 100.0, metrics.mae, metrics.rmse, metrics.psnr_db, metrics.ssim },
+        );
+
+        if (cam_idx == 0 or cam_idx == 3 or cam_idx == 5 or cam_idx == 8 or cam_idx == images.len - 1) {
+            const virt_path = try std.fmt.allocPrint(arena, "{s}/cam_{d:02}_virtual.ppm", .{ verify_dir, cam_idx });
+            const real_path = try std.fmt.allocPrint(arena, "{s}/cam_{d:02}_real.ppm", .{ verify_dir, cam_idx });
+            try sfm.render.writePpm(gpa, io, virt_path, ren.width, ren.height, ren.rgb);
+            try sfm.render.writePpm(gpa, io, real_path, img.width, img.height, img.rgb);
+        }
+    }
+
+    if (n_eval > 0) {
+        const nf: f64 = @floatFromInt(n_eval);
+        std.log.info(
+            "Verify mean ({d} cams): coverage={d:.1}% MAE={d:.2} RMSE={d:.2} PSNR={d:.2} dB SSIM={d:.4}",
+            .{ n_eval, (cov_sum / nf) * 100.0, mae_sum / nf, rmse_sum / nf, psnr_sum / nf, ssim_sum / nf },
+        );
+    }
+
+    // Held-out texture test on middle camera: build same mesh without projecting holdout camera's photo
+    const holdout_idx = images.len / 2;
+    if (images.len >= 3 and result.registered[holdout_idx]) {
+        const reg_holdout = try gpa.dupe(bool, result.registered);
+        defer gpa.free(reg_holdout);
+        reg_holdout[holdout_idx] = false;
+
+        var holdout_mesh = try sfm.mesh.buildColoredMesh(gpa, result.points, result.colors, reg_poses, .{});
+        defer holdout_mesh.deinit(gpa);
+        try sfm.mesh.subdivideAndProjectTexture(gpa, &holdout_mesh, k, images, result.poses, reg_holdout, 2);
+
+        const target_img = images[holdout_idx];
+        var ren_holdout = try sfm.render.renderMeshView(
+            gpa,
+            target_img.width,
+            target_img.height,
+            k,
+            result.poses[holdout_idx],
+            holdout_mesh.points,
+            holdout_mesh.colors,
+            holdout_mesh.faces,
+        );
+        defer ren_holdout.deinit(gpa);
+
+        const hm = sfm.render.computeViewMetrics(ren_holdout, target_img);
+        std.log.info(
+            "Holdout cam {d:02} (unseen texture): coverage={d:.1}% MAE={d:.2} RMSE={d:.2} PSNR={d:.2} dB SSIM={d:.4}",
+            .{ holdout_idx, hm.coverage_ratio * 100.0, hm.mae, hm.rmse, hm.psnr_db, hm.ssim },
+        );
+        const holdout_path = try std.fmt.allocPrint(arena, "{s}/holdout_{d:02}_virtual.ppm", .{ verify_dir, holdout_idx });
+        try sfm.render.writePpm(gpa, io, holdout_path, ren_holdout.width, ren_holdout.height, ren_holdout.rgb);
+    }
+
+    // Interpolated novel viewpoint between camera 4 and camera 5
+    if (images.len > 5 and result.registered[4] and result.registered[5]) {
+        const novel_pose = sfm.render.interpolatePose(result.poses[4], result.poses[5], 0.5);
+        const ref_img = images[4];
+        var ren_novel = try sfm.render.renderMeshView(
+            gpa,
+            ref_img.width,
+            ref_img.height,
+            k,
+            novel_pose,
+            colored_mesh.points,
+            colored_mesh.colors,
+            colored_mesh.faces,
+        );
+        defer ren_novel.deinit(gpa);
+        const novel_path = try std.fmt.allocPrint(arena, "{s}/novel_mid45_virtual.ppm", .{verify_dir});
+        try sfm.render.writePpm(gpa, io, novel_path, ren_novel.width, ren_novel.height, ren_novel.rgb);
+    }
 }
 
 fn isImageFilename(name: []const u8) bool {
