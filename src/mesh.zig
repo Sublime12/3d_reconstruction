@@ -164,9 +164,15 @@ const CellKey2D = struct {
     y: i32,
 };
 
-const CellBest = struct {
-    idx: usize,
-    depth: f64,
+const CellAcc = struct {
+    sx: f64,
+    sy: f64,
+    sz: f64,
+    sr: u64,
+    sg: u64,
+    sb: u64,
+    count: u64,
+    depth_sum: f64,
 };
 
 fn frontSurfaceDedup2D(
@@ -176,11 +182,11 @@ fn frontSurfaceDedup2D(
     basis: ViewBasis,
     cell_size: f64,
 ) !struct { points: []Vec3, colors: []Color } {
-    var grid = std.AutoHashMap(CellKey2D, CellBest).init(allocator);
+    var grid = std.AutoHashMap(CellKey2D, CellAcc).init(allocator);
     defer grid.deinit();
 
     const inv_c = 1.0 / cell_size;
-    for (points, 0..) |pt, i| {
+    for (points, colors) |pt, col| {
         const d = pt.sub(basis.origin);
         const u = d.dot(basis.u);
         const v = d.dot(basis.v);
@@ -190,20 +196,70 @@ fn frontSurfaceDedup2D(
             .y = @intFromFloat(@floor(v * inv_c)),
         };
         const gop = try grid.getOrPut(key);
-        if (!gop.found_existing or depth < gop.value_ptr.depth) {
-            gop.value_ptr.* = .{ .idx = i, .depth = depth };
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{
+                .sx = pt.x,
+                .sy = pt.y,
+                .sz = pt.z,
+                .sr = col.r,
+                .sg = col.g,
+                .sb = col.b,
+                .count = 1,
+                .depth_sum = depth,
+            };
+        } else {
+            gop.value_ptr.sx += pt.x;
+            gop.value_ptr.sy += pt.y;
+            gop.value_ptr.sz += pt.z;
+            gop.value_ptr.sr += col.r;
+            gop.value_ptr.sg += col.g;
+            gop.value_ptr.sb += col.b;
+            gop.value_ptr.count += 1;
+            gop.value_ptr.depth_sum += depth;
         }
     }
 
-    const out_pts = try allocator.alloc(Vec3, grid.count());
+    const n_out = grid.count();
+    const out_pts = try allocator.alloc(Vec3, n_out);
     errdefer allocator.free(out_pts);
-    const out_cols = try allocator.alloc(Color, grid.count());
+    const out_cols = try allocator.alloc(Color, n_out);
 
-    var it = grid.valueIterator();
+    // 3x3 median depth filtering across neighboring 2D cells removes depth spikes cleanly
+    var it = grid.iterator();
     var out_i: usize = 0;
-    while (it.next()) |best| : (out_i += 1) {
-        out_pts[out_i] = points[best.idx];
-        out_cols[out_i] = colors[best.idx];
+    while (it.next()) |entry| : (out_i += 1) {
+        const key = entry.key_ptr.*;
+        const acc = entry.value_ptr.*;
+        const cf: f64 = @floatFromInt(acc.count);
+        var pt = Vec3.init(acc.sx / cf, acc.sy / cf, acc.sz / cf);
+        const cur_depth = acc.depth_sum / cf;
+
+        var nbr_depths: [9]f64 = undefined;
+        var nd_len: usize = 0;
+        var dy: i32 = -1;
+        while (dy <= 1) : (dy += 1) {
+            var dx: i32 = -1;
+            while (dx <= 1) : (dx += 1) {
+                if (grid.get(.{ .x = key.x + dx, .y = key.y + dy })) |n_acc| {
+                    nbr_depths[nd_len] = n_acc.depth_sum / @as(f64, @floatFromInt(n_acc.count));
+                    nd_len += 1;
+                }
+            }
+        }
+        if (nd_len >= 3) {
+            std.mem.sort(f64, nbr_depths[0..nd_len], {}, std.sort.asc(f64));
+            const med_depth = nbr_depths[nd_len / 2];
+            if (@abs(cur_depth - med_depth) > cell_size * 1.5) {
+                pt = pt.add(basis.forward.scale(med_depth - cur_depth));
+            }
+        }
+
+        out_pts[out_i] = pt;
+        out_cols[out_i] = .{
+            .r = @intCast(acc.sr / acc.count),
+            .g = @intCast(acc.sg / acc.count),
+            .b = @intCast(acc.sb / acc.count),
+        };
     }
     return .{ .points = out_pts, .colors = out_cols };
 }

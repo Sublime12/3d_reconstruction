@@ -10,9 +10,10 @@ const Color = @import("io_ply.zig").Color;
 pub const DenseConfig = struct {
     stride: u32 = 3,
     depth_steps: usize = 80,
-    patch_radius: isize = 2,
-    min_zncc: f64 = 0.68,
-    min_grad: f64 = 3.0,
+    patch_radius: isize = 3,
+    min_zncc: f64 = 0.74,
+    min_grad: f64 = 4.0,
+    min_uniqueness: f64 = 0.03,
     max_points: usize = 35000,
     num_threads: usize = 0,
 };
@@ -367,7 +368,7 @@ fn reconstructRefView(
             const vf: f64 = @floatFromInt(y);
 
             // Extract reference patch & check texture variance
-            var ref_patch: [25]f64 = undefined;
+            var ref_patch: [81]f64 = undefined;
             var ref_mean: f64 = 0;
             var p_len: usize = 0;
             var dy: isize = -pr;
@@ -441,6 +442,15 @@ fn reconstructRefView(
             }
 
             if (best_score >= config.min_zncc) {
+                var second_peak: f64 = -1.0;
+                for (0..n_steps) |ds| {
+                    const diff = if (ds > best_ds) ds - best_ds else best_ds - ds;
+                    if (diff > 3 and scores_buf[ds] > second_peak) {
+                        second_peak = scores_buf[ds];
+                    }
+                }
+                if (best_score - second_peak < config.min_uniqueness) continue;
+
                 // Parabolic sub-step depth interpolation to eliminate staircase quantization
                 var sub_ds: f64 = @floatFromInt(best_ds);
                 if (best_ds > 0 and best_ds + 1 < n_steps) {
@@ -480,7 +490,7 @@ fn computePatchZncc(
     ref_zero_mean: []const f64,
     ref_var: f64,
 ) ?f64 {
-    var patch: [25]f64 = undefined;
+    var patch: [81]f64 = undefined;
     var mean: f64 = 0;
     var idx: usize = 0;
 
