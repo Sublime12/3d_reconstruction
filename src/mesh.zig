@@ -21,15 +21,14 @@ pub const Mesh = struct {
 
 pub const MeshConfig = struct {
     knn: usize = 8,
-    outlier_std_mult: f64 = 2.0,
-    adaptive_edge_factor: f64 = 2.8,
-    max_global_scale_mult: f64 = 4.5,
-    min_view_cos: f64 = 0.05,
+    outlier_std_mult: f64 = 1.2,
+    max_edge_factor: f64 = 4.5,
+    min_view_cos: f64 = 0.15,
 };
 
-/// Filter sparse 3D points to coherent structure (Statistical Outlier Removal)
-/// and build a colored 3D triangle mesh via view-plane Delaunay triangulation
-/// with per-region adaptive k-NN edge thresholding.
+/// Filter sparse 3D points to those forming coherent local structure (Statistical Outlier Removal)
+/// and build a colored 3D triangle mesh via Bowyer-Watson Delaunay triangulation in the view plane
+/// with 3D edge-length and grazing-angle pruning.
 pub fn buildColoredMesh(
     allocator: std.mem.Allocator,
     raw_points: []const Vec3,
@@ -46,13 +45,12 @@ pub fn buildColoredMesh(
         };
     }
 
-    // 1. Filter floating outliers and compute each kept vertex's local k-NN spacing
+    // 1. Statistical Outlier Removal: keep points belonging to coherent local structure
     const filtered = try filterStructurePoints(allocator, raw_points, raw_colors, config.knn, config.outlier_std_mult);
     errdefer {
         allocator.free(filtered.points);
         allocator.free(filtered.colors);
     }
-    defer allocator.free(filtered.local_scales);
 
     if (filtered.points.len < 3) {
         return .{
@@ -62,7 +60,7 @@ pub fn buildColoredMesh(
         };
     }
 
-    // 2. Project onto orthonormal view plane from average camera forward axis
+    // 2. Compute orthonormal view plane from average camera forward axis
     const basis = computeViewBasis(filtered.points, poses);
     const pts2d = try allocator.alloc(Vec2, filtered.points.len);
     defer allocator.free(pts2d);
@@ -75,43 +73,23 @@ pub fn buildColoredMesh(
     const raw_faces = try triangulateDelaunay2D(allocator, pts2d);
     defer allocator.free(raw_faces);
 
-    // 4. Prune triangles using adaptive per-region k-NN edge thresholds
-    const sorted_scales = try allocator.dupe(f64, filtered.local_scales);
-    defer allocator.free(sorted_scales);
-    std.mem.sort(f64, sorted_scales, {}, std.sort.asc(f64));
-    const med_scale = sorted_scales[sorted_scales.len / 2];
-    const p90_scale = sorted_scales[(sorted_scales.len * 9) / 10];
-    const min_local_scale = med_scale * 0.5;
-    const hard_max_edge = p90_scale * config.max_global_scale_mult;
+    // 4. Prune triangles spanning depth jumps or empty gaps using 3D median NN distance
+    const max_edge = filtered.median_nn * config.max_edge_factor;
+    const max_edge_sq = max_edge * max_edge;
 
     var faces: std.ArrayList(Triangle) = .empty;
     errdefer faces.deinit(allocator);
 
     for (raw_faces) |tri| {
-        const v0 = tri[0];
-        const v1 = tri[1];
-        const v2 = tri[2];
-
-        const a = filtered.points[v0];
-        const b = filtered.points[v1];
-        const c = filtered.points[v2];
-
-        const s0 = @max(filtered.local_scales[v0], min_local_scale);
-        const s1 = @max(filtered.local_scales[v1], min_local_scale);
-        const s2 = @max(filtered.local_scales[v2], min_local_scale);
-
-        const limit_ab = @min(hard_max_edge, @max(s0, s1) * config.adaptive_edge_factor);
-        const limit_bc = @min(hard_max_edge, @max(s1, s2) * config.adaptive_edge_factor);
-        const limit_ca = @min(hard_max_edge, @max(s2, s0) * config.adaptive_edge_factor);
+        const a = filtered.points[tri[0]];
+        const b = filtered.points[tri[1]];
+        const c = filtered.points[tri[2]];
 
         const ab = b.sub(a);
         const bc = c.sub(b);
         const ca = a.sub(c);
 
-        if (ab.normSq() > limit_ab * limit_ab or
-            bc.normSq() > limit_bc * limit_bc or
-            ca.normSq() > limit_ca * limit_ca)
-        {
+        if (ab.normSq() > max_edge_sq or bc.normSq() > max_edge_sq or ca.normSq() > max_edge_sq) {
             continue;
         }
 
@@ -125,7 +103,7 @@ pub fn buildColoredMesh(
 
         // Orient winding so normal faces toward cameras (-forward)
         if (view_cos > 0) {
-            try faces.append(allocator, .{ v0, v2, v1 });
+            try faces.append(allocator, .{ tri[0], tri[2], tri[1] });
         } else {
             try faces.append(allocator, tri);
         }
@@ -141,7 +119,7 @@ pub fn buildColoredMesh(
 const FilteredPoints = struct {
     points: []Vec3,
     colors: []Color,
-    local_scales: []f64,
+    median_nn: f64,
 };
 
 fn filterStructurePoints(
@@ -154,17 +132,17 @@ fn filterStructurePoints(
     const n = points.len;
     const k = @min(knn_req, n - 1);
     if (k == 0) {
-        const scales = try allocator.alloc(f64, n);
-        @memset(scales, 1.0);
         return .{
             .points = try allocator.dupe(Vec3, points),
             .colors = try allocator.dupe(Color, colors),
-            .local_scales = scales,
+            .median_nn = 1.0,
         };
     }
 
     const knn_means = try allocator.alloc(f64, n);
     defer allocator.free(knn_means);
+    const nn1_dists = try allocator.alloc(f64, n);
+    defer allocator.free(nn1_dists);
 
     const topk = try allocator.alloc(f64, k);
     defer allocator.free(topk);
@@ -183,6 +161,7 @@ fn filterStructurePoints(
                 }
             }
         }
+        nn1_dists[i] = @sqrt(topk[0]);
         var sum: f64 = 0;
         for (topk) |d_sq| sum += @sqrt(d_sq);
         knn_means[i] = sum / @as(f64, @floatFromInt(k));
@@ -204,21 +183,24 @@ fn filterStructurePoints(
     errdefer out_pts.deinit(allocator);
     var out_cols: std.ArrayList(Color) = .empty;
     errdefer out_cols.deinit(allocator);
-    var out_scales: std.ArrayList(f64) = .empty;
-    errdefer out_scales.deinit(allocator);
+    var kept_nn1: std.ArrayList(f64) = .empty;
+    defer kept_nn1.deinit(allocator);
 
     for (0..n) |i| {
         if (knn_means[i] <= thresh) {
             try out_pts.append(allocator, points[i]);
             try out_cols.append(allocator, colors[i]);
-            try out_scales.append(allocator, @max(knn_means[i], 1e-6));
+            try kept_nn1.append(allocator, nn1_dists[i]);
         }
     }
+
+    std.mem.sort(f64, kept_nn1.items, {}, std.sort.asc(f64));
+    const median_nn = if (kept_nn1.items.len > 0) kept_nn1.items[kept_nn1.items.len / 2] else 1.0;
 
     return .{
         .points = try out_pts.toOwnedSlice(allocator),
         .colors = try out_cols.toOwnedSlice(allocator),
-        .local_scales = try out_scales.toOwnedSlice(allocator),
+        .median_nn = @max(median_nn, 1e-6),
     };
 }
 
@@ -413,32 +395,24 @@ fn triHasEdge(v: [3]usize, a: usize, b: usize) bool {
     return false;
 }
 
-test "buildColoredMesh adaptive k-NN preserves both dense and sparse surface regions" {
+test "buildColoredMesh filters outliers and triangulates coherent 3D grid" {
     const gpa = std.testing.allocator;
     var pts: std.ArrayList(Vec3) = .empty;
     defer pts.deinit(gpa);
     var cols: std.ArrayList(Color) = .empty;
     defer cols.deinit(gpa);
 
-    // Dense region: 6x6 grid with spacing 0.2
+    // 6x6 curved surface patch
     for (0..6) |gy| {
         for (0..6) |gx| {
-            const x = @as(f64, @floatFromInt(gx)) * 0.2;
-            const y = @as(f64, @floatFromInt(gy)) * 0.2;
-            try pts.append(gpa, Vec3.init(x, y, 5.0));
-            try cols.append(gpa, .{ .r = 120, .g = 120, .b = 200 });
+            const x: f64 = @floatFromInt(gx);
+            const y: f64 = @floatFromInt(gy);
+            const z: f64 = 5.0 + 0.1 * (x - 2.5) * (x - 2.5);
+            try pts.append(gpa, Vec3.init(x, y, z));
+            try cols.append(gpa, .{ .r = @intCast(gx * 40), .g = @intCast(gy * 40), .b = 180 });
         }
     }
-    // Sparse region: 4x4 grid with spacing 0.8 (4x sparser than dense region)
-    for (0..4) |gy| {
-        for (0..4) |gx| {
-            const x = 1.6 + @as(f64, @floatFromInt(gx)) * 0.8;
-            const y = @as(f64, @floatFromInt(gy)) * 0.8;
-            try pts.append(gpa, Vec3.init(x, y, 5.0));
-            try cols.append(gpa, .{ .r = 200, .g = 150, .b = 100 });
-        }
-    }
-    // Floating outlier far away
+    // Add an isolated floating outlier far from the surface
     try pts.append(gpa, Vec3.init(50.0, 50.0, 50.0));
     try cols.append(gpa, .{ .r = 255, .g = 0, .b = 0 });
 
@@ -446,13 +420,7 @@ test "buildColoredMesh adaptive k-NN preserves both dense and sparse surface reg
     var mesh = try buildColoredMesh(gpa, pts.items, cols.items, &poses, .{});
     defer mesh.deinit(gpa);
 
-    // Outlier removed (36 + 16 = 52 kept), and triangles exist in the sparse region (x > 1.5)
-    try std.testing.expectEqual(@as(usize, 52), mesh.points.len);
-    var sparse_tris: usize = 0;
-    for (mesh.faces) |f| {
-        if (mesh.points[f[0]].x > 1.5 and mesh.points[f[1]].x > 1.5 and mesh.points[f[2]].x > 1.5) {
-            sparse_tris += 1;
-        }
-    }
-    try std.testing.expect(sparse_tris >= 12);
+    // Outlier removed; 36 grid vertices form 2*(5*5) = 50 triangles
+    try std.testing.expectEqual(@as(usize, 36), mesh.points.len);
+    try std.testing.expectEqual(@as(usize, 50), mesh.faces.len);
 }
