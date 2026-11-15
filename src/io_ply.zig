@@ -14,6 +14,16 @@ pub fn formatPly(
     colors: []const Color,
     poses: []const CameraPose,
 ) ![]u8 {
+    return formatPlyMesh(allocator, points, colors, &.{}, poses);
+}
+
+pub fn formatPlyMesh(
+    allocator: std.mem.Allocator,
+    points: []const Vec3,
+    colors: []const Color,
+    faces: []const [3]usize,
+    poses: []const CameraPose,
+) ![]u8 {
     std.debug.assert(points.len == colors.len);
     const total_verts = points.len + poses.len;
 
@@ -30,9 +40,11 @@ pub fn formatPly(
         \\property uchar red
         \\property uchar green
         \\property uchar blue
+        \\element face {d}
+        \\property list uchar int vertex_indices
         \\end_header
         \\
-    , .{total_verts});
+    , .{ total_verts, faces.len });
 
     for (points, colors) |pt, col| {
         try buf.print(allocator, "{d:.6} {d:.6} {d:.6} {d} {d} {d}\n", .{
@@ -45,6 +57,10 @@ pub fn formatPly(
         try buf.print(allocator, "{d:.6} {d:.6} {d:.6} 0 255 0\n", .{
             cleanZero(c.x), cleanZero(c.y), cleanZero(c.z),
         });
+    }
+
+    for (faces) |f| {
+        try buf.print(allocator, "3 {d} {d} {d}\n", .{ f[0], f[1], f[2] });
     }
 
     return try buf.toOwnedSlice(allocator);

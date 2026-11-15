@@ -11,7 +11,7 @@ pub const pnp = @import("pnp.zig");
 pub const bundle_adjust = @import("bundle_adjust.zig");
 pub const io_ply = @import("io_ply.zig");
 pub const pipeline = @import("pipeline.zig");
-pub const dense = @import("dense.zig");
+pub const mesh = @import("mesh.zig");
 
 test {
     std.testing.refAllDecls(@This());
