@@ -12,6 +12,7 @@ pub fn main(init: std.process.Init) !void {
     var data_dir: []const u8 = "data/fountain-p11";
     var out_path: []const u8 = "output/reconstruction.ply";
     var max_dim: u32 = 1200;
+    var num_threads: usize = 1;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -24,9 +25,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-dim") and i + 1 < args.len) {
             i += 1;
             max_dim = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
+            i += 1;
+            num_threads = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             std.debug.print(
-                "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>]\n",
+                "Usage: sfm [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>]\n",
                 .{},
             );
             return;
@@ -88,9 +92,12 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("Loaded {s} ({d}x{d})", .{ name, img.width, img.height });
     }
 
-    std.log.info("Running single-threaded Incremental SfM on {d} images...", .{images.len});
-    var result = try sfm.pipeline.runIncrementalSfm(gpa, k, images, .{});
+    std.log.info("Running Incremental SfM on {d} images (threads={d})...", .{ images.len, num_threads });
+    const t_start = Io.Clock.now(.awake, io);
+    var result = try sfm.pipeline.runIncrementalSfm(gpa, k, images, .{ .num_threads = num_threads });
     defer result.deinit(gpa);
+    const elapsed_ns = t_start.durationTo(Io.Clock.now(.awake, io)).nanoseconds;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1e6;
 
     var reg_poses: std.ArrayList(sfm.lie.CameraPose) = .empty;
     defer reg_poses.deinit(gpa);
@@ -107,8 +114,8 @@ pub fn main(init: std.process.Init) !void {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = ply_bytes });
 
     std.log.info(
-        "Done! Registered {d}/{d} cameras, {d} 3D points, mean reproj error = {d:.3} px -> {s}",
-        .{ result.registered_count, images.len, result.points.len, result.mean_reproj_err, out_path },
+        "Done in {d:.1} ms! Registered {d}/{d} cameras, {d} 3D points, mean reproj error = {d:.3} px -> {s}",
+        .{ elapsed_ms, result.registered_count, images.len, result.points.len, result.mean_reproj_err, out_path },
     );
 }
 

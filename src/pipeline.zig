@@ -39,6 +39,8 @@ pub const SfmConfig = struct {
     reproj_thresh_px: f64 = 3.0,
     min_triang_angle_rad: f64 = 0.02, // ~1.15 deg
     seed: u64 = 42,
+    /// 1 = single-threaded CPU, 0 = auto-detect CPU core count, >1 = explicit thread count
+    num_threads: usize = 1,
 };
 
 pub const SfmResult = struct {
@@ -67,96 +69,109 @@ pub fn runIncrementalSfm(
     const n_cams = images.len;
     if (n_cams < 2) return error.NotEnoughImages;
 
-    // 1. Feature detection
+    const effective_threads = resolveThreadCount(config.num_threads);
+
+    // 1. Feature detection (single-threaded or multi-threaded)
     const all_kps = try allocator.alloc([]features.Keypoint, n_cams);
+    for (all_kps) |*slot| slot.* = &.{};
     defer {
         for (all_kps) |kps| allocator.free(kps);
         allocator.free(all_kps);
     }
     const all_uvs = try allocator.alloc([]Vec2, n_cams);
+    for (all_uvs) |*slot| slot.* = &.{};
     defer {
         for (all_uvs) |uvs| allocator.free(uvs);
         allocator.free(all_uvs);
     }
     const all_cols = try allocator.alloc([]Color, n_cams);
+    for (all_cols) |*slot| slot.* = &.{};
     defer {
         for (all_cols) |cols| allocator.free(cols);
         allocator.free(all_cols);
     }
 
-    for (images, 0..) |img, ci| {
-        all_kps[ci] = try features.detectAndCompute(
-            allocator,
-            .{ .width = img.width, .height = img.height, .gray = img.gray },
-            config.max_keypoints,
-        );
-        all_uvs[ci] = try allocator.alloc(Vec2, all_kps[ci].len);
-        all_cols[ci] = try allocator.alloc(Color, all_kps[ci].len);
-        for (all_kps[ci], 0..) |kp, ki| {
-            all_uvs[ci][ki] = Vec2.init(kp.x, kp.y);
-            const px: usize = @intFromFloat(std.math.clamp(@round(kp.x), 0.0, @as(f64, @floatFromInt(img.width - 1))));
-            const py: usize = @intFromFloat(std.math.clamp(@round(kp.y), 0.0, @as(f64, @floatFromInt(img.height - 1))));
-            const rgb_idx = (py * img.width + px) * 3;
-            all_cols[ci][ki] = .{
-                .r = img.rgb[rgb_idx + 0],
-                .g = img.rgb[rgb_idx + 1],
-                .b = img.rgb[rgb_idx + 2],
-            };
+    if (effective_threads <= 1 or n_cams <= 1) {
+        for (0..n_cams) |ci| {
+            try detectImageFeatures(allocator, images[ci], config.max_keypoints, &all_kps[ci], &all_uvs[ci], &all_cols[ci]);
+        }
+    } else {
+        var next_cam = std.atomic.Value(usize).init(0);
+        const worker_count = @min(effective_threads, n_cams);
+        const threads = try allocator.alloc(std.Thread, worker_count);
+        defer allocator.free(threads);
+        var failed = std.atomic.Value(bool).init(false);
+
+        for (threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, detectWorker, .{
+                allocator,
+                images,
+                config.max_keypoints,
+                all_kps,
+                all_uvs,
+                all_cols,
+                &next_cam,
+                &failed,
+            });
+        }
+        for (threads) |th| th.join();
+        if (failed.load(.acquire)) return error.FeatureExtractionFailed;
+    }
+
+    // 2. Pairwise matching + geometric verification (single-threaded or multi-threaded)
+    const n_pairs = (n_cams * (n_cams - 1)) / 2;
+    const pair_indices = try allocator.alloc([2]usize, n_pairs);
+    defer allocator.free(pair_indices);
+    var p_idx: usize = 0;
+    for (0..n_cams) |i| {
+        for (i + 1..n_cams) |j| {
+            pair_indices[p_idx] = .{ i, j };
+            p_idx += 1;
         }
     }
 
-    // 2. Pairwise matching + geometric verification
-    var verified_pairs: std.ArrayList(PairwiseVerified) = .empty;
+    const pair_slots = try allocator.alloc(?PairwiseVerified, n_pairs);
+    @memset(pair_slots, null);
     defer {
-        for (verified_pairs.items) |*vp| vp.deinit(allocator);
-        verified_pairs.deinit(allocator);
+        for (pair_slots) |*slot| {
+            if (slot.*) |*vp| vp.deinit(allocator);
+        }
+        allocator.free(pair_slots);
     }
 
-    for (0..n_cams) |i| {
-        for (i + 1..n_cams) |j| {
-            const raw_matches = try features.matchDescriptors(
-                allocator,
-                all_kps[i],
-                all_kps[j],
-                config.match_ratio,
-                config.max_hamming,
-            );
-            defer allocator.free(raw_matches);
-            if (raw_matches.len < 16) continue;
+    if (effective_threads <= 1 or n_pairs <= 1) {
+        for (pair_indices, 0..) |pair, idx| {
+            pair_slots[idx] = try verifyPair(allocator, k, all_kps, all_uvs, pair[0], pair[1], config);
+        }
+    } else {
+        var next_pair = std.atomic.Value(usize).init(0);
+        const worker_count = @min(effective_threads, n_pairs);
+        const threads = try allocator.alloc(std.Thread, worker_count);
+        defer allocator.free(threads);
+        var failed = std.atomic.Value(bool).init(false);
 
-            const pts1 = try allocator.alloc(Vec2, raw_matches.len);
-            defer allocator.free(pts1);
-            const pts2 = try allocator.alloc(Vec2, raw_matches.len);
-            defer allocator.free(pts2);
-            for (raw_matches, 0..) |m, idx| {
-                pts1[idx] = all_uvs[i][m.idx1];
-                pts2[idx] = all_uvs[j][m.idx2];
-            }
-
-            var er = (try epipolar.estimateEssentialRansac(
+        for (threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, verifyPairWorker, .{
                 allocator,
                 k,
-                pts1,
-                pts2,
-                config.ransac_iters,
-                config.ransac_thresh_px,
-                config.seed +% @as(u64, i * 1000 + j),
-            )) orelse continue;
-            defer er.deinit(allocator);
-
-            if (er.inliers.len < 16) continue;
-
-            const inlier_matches = try allocator.alloc(features.Match, er.inliers.len);
-            for (er.inliers, 0..) |in_idx, out_idx| {
-                inlier_matches[out_idx] = raw_matches[in_idx];
-            }
-
-            try verified_pairs.append(allocator, .{
-                .cam1 = i,
-                .cam2 = j,
-                .e = er.e,
-                .matches = inlier_matches,
+                all_kps,
+                all_uvs,
+                pair_indices,
+                pair_slots,
+                config,
+                &next_pair,
+                &failed,
             });
+        }
+        for (threads) |th| th.join();
+        if (failed.load(.acquire)) return error.PairVerificationFailed;
+    }
+
+    var verified_pairs: std.ArrayList(PairwiseVerified) = .empty;
+    defer verified_pairs.deinit(allocator);
+    for (pair_slots) |slot| {
+        if (slot) |vp| {
+            try verified_pairs.append(allocator, vp);
         }
     }
 
@@ -554,6 +569,148 @@ fn runGlobalBA(
 
     for (compact_to_cam.items, 0..) |ci, c_idx| {
         poses[ci] = compact_poses[c_idx];
+    }
+}
+
+fn resolveThreadCount(num_threads: usize) usize {
+    if (num_threads == 0) {
+        return std.Thread.getCpuCount() catch 4;
+    }
+    return num_threads;
+}
+
+fn detectImageFeatures(
+    allocator: std.mem.Allocator,
+    img: dataset.ImageData,
+    max_keypoints: usize,
+    out_kps: *[]features.Keypoint,
+    out_uvs: *[]Vec2,
+    out_cols: *[]Color,
+) !void {
+    const kps = try features.detectAndCompute(
+        allocator,
+        .{ .width = img.width, .height = img.height, .gray = img.gray },
+        max_keypoints,
+    );
+    errdefer allocator.free(kps);
+
+    const uvs = try allocator.alloc(Vec2, kps.len);
+    errdefer allocator.free(uvs);
+    const cols = try allocator.alloc(Color, kps.len);
+    errdefer allocator.free(cols);
+
+    for (kps, 0..) |kp, ki| {
+        uvs[ki] = Vec2.init(kp.x, kp.y);
+        const px: usize = @intFromFloat(std.math.clamp(@round(kp.x), 0.0, @as(f64, @floatFromInt(img.width - 1))));
+        const py: usize = @intFromFloat(std.math.clamp(@round(kp.y), 0.0, @as(f64, @floatFromInt(img.height - 1))));
+        const rgb_idx = (py * img.width + px) * 3;
+        cols[ki] = .{
+            .r = img.rgb[rgb_idx + 0],
+            .g = img.rgb[rgb_idx + 1],
+            .b = img.rgb[rgb_idx + 2],
+        };
+    }
+
+    out_kps.* = kps;
+    out_uvs.* = uvs;
+    out_cols.* = cols;
+}
+
+fn detectWorker(
+    allocator: std.mem.Allocator,
+    images: []const dataset.ImageData,
+    max_keypoints: usize,
+    all_kps: [][]features.Keypoint,
+    all_uvs: [][]Vec2,
+    all_cols: [][]Color,
+    next_cam: *std.atomic.Value(usize),
+    failed: *std.atomic.Value(bool),
+) void {
+    while (true) {
+        if (failed.load(.acquire)) return;
+        const ci = next_cam.fetchAdd(1, .monotonic);
+        if (ci >= images.len) return;
+        detectImageFeatures(allocator, images[ci], max_keypoints, &all_kps[ci], &all_uvs[ci], &all_cols[ci]) catch {
+            failed.store(true, .release);
+            return;
+        };
+    }
+}
+
+fn verifyPair(
+    allocator: std.mem.Allocator,
+    k: Mat3,
+    all_kps: []const []const features.Keypoint,
+    all_uvs: []const []const Vec2,
+    i: usize,
+    j: usize,
+    config: SfmConfig,
+) !?PairwiseVerified {
+    const raw_matches = try features.matchDescriptors(
+        allocator,
+        all_kps[i],
+        all_kps[j],
+        config.match_ratio,
+        config.max_hamming,
+    );
+    defer allocator.free(raw_matches);
+    if (raw_matches.len < 16) return null;
+
+    const pts1 = try allocator.alloc(Vec2, raw_matches.len);
+    defer allocator.free(pts1);
+    const pts2 = try allocator.alloc(Vec2, raw_matches.len);
+    defer allocator.free(pts2);
+    for (raw_matches, 0..) |m, idx| {
+        pts1[idx] = all_uvs[i][m.idx1];
+        pts2[idx] = all_uvs[j][m.idx2];
+    }
+
+    var er = (try epipolar.estimateEssentialRansac(
+        allocator,
+        k,
+        pts1,
+        pts2,
+        config.ransac_iters,
+        config.ransac_thresh_px,
+        config.seed +% @as(u64, i * 1000 + j),
+    )) orelse return null;
+    defer er.deinit(allocator);
+
+    if (er.inliers.len < 16) return null;
+
+    const inlier_matches = try allocator.alloc(features.Match, er.inliers.len);
+    for (er.inliers, 0..) |in_idx, out_idx| {
+        inlier_matches[out_idx] = raw_matches[in_idx];
+    }
+
+    return .{
+        .cam1 = i,
+        .cam2 = j,
+        .e = er.e,
+        .matches = inlier_matches,
+    };
+}
+
+fn verifyPairWorker(
+    allocator: std.mem.Allocator,
+    k: Mat3,
+    all_kps: []const []const features.Keypoint,
+    all_uvs: []const []const Vec2,
+    pair_indices: []const [2]usize,
+    pair_slots: []?PairwiseVerified,
+    config: SfmConfig,
+    next_pair: *std.atomic.Value(usize),
+    failed: *std.atomic.Value(bool),
+) void {
+    while (true) {
+        if (failed.load(.acquire)) return;
+        const idx = next_pair.fetchAdd(1, .monotonic);
+        if (idx >= pair_indices.len) return;
+        const pair = pair_indices[idx];
+        pair_slots[idx] = verifyPair(allocator, k, all_kps, all_uvs, pair[0], pair[1], config) catch {
+            failed.store(true, .release);
+            return;
+        };
     }
 }
 
