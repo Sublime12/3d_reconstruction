@@ -105,8 +105,26 @@ pub fn main(init: std.process.Init) !void {
         if (is_reg) try reg_poses.append(gpa, p);
     }
 
-    std.log.info("Building colored surface mesh from {d} sparse points...", .{result.points.len});
-    var colored_mesh = try sfm.mesh.buildColoredMesh(gpa, result.points, result.colors, reg_poses.items, .{});
+    std.log.info("Running Dense MVS (ZNCC) from {d} sparse points...", .{result.points.len});
+    var dense_cloud = try sfm.dense.runDenseMvs(
+        gpa,
+        k,
+        images,
+        result.poses,
+        result.registered,
+        result.points,
+        .{ .num_threads = num_threads },
+    );
+    defer dense_cloud.deinit(gpa);
+
+    std.log.info("Building colored surface mesh from {d} dense points...", .{dense_cloud.points.len});
+    var colored_mesh = try sfm.mesh.buildColoredMesh(gpa, dense_cloud.points, dense_cloud.colors, reg_poses.items, .{
+        .outlier_std_mult = 2.0,
+        .max_edge_factor = 4.5,
+        .min_view_cos = 0.02,
+        .dedup_2d_factor = 0.4,
+        .laplacian_iters = 2,
+    });
     defer colored_mesh.deinit(gpa);
 
     std.log.info("Subdividing mesh and projecting photos onto {d} triangles...", .{colored_mesh.faces.len});
@@ -117,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
         images,
         result.poses,
         result.registered,
-        2,
+        1,
     );
 
     const ply_bytes = try sfm.io_ply.formatPlyMesh(

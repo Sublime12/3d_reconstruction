@@ -27,6 +27,8 @@ pub const MeshConfig = struct {
     outlier_std_mult: f64 = 1.2,
     max_edge_factor: f64 = 4.5,
     min_view_cos: f64 = 0.15,
+    dedup_2d_factor: f64 = 0.0,
+    laplacian_iters: usize = 0,
 };
 
 /// Filter sparse 3D points to those forming coherent local structure (Statistical Outlier Removal)
@@ -63,11 +65,31 @@ pub fn buildColoredMesh(
         };
     }
 
-    // 2. Compute orthonormal view plane from average camera forward axis
+    // 2. Compute orthonormal view plane and optionally front-surface deduplicate 2D cells
     const basis = computeViewBasis(filtered.points, poses);
-    const pts2d = try allocator.alloc(Vec2, filtered.points.len);
+
+    var mesh_pts = filtered.points;
+    var mesh_cols = filtered.colors;
+    if (config.dedup_2d_factor > 0) {
+        const cell_size = @max(filtered.median_nn * config.dedup_2d_factor, 1e-6);
+        const dedup = try frontSurfaceDedup2D(allocator, mesh_pts, mesh_cols, basis, cell_size);
+        allocator.free(mesh_pts);
+        allocator.free(mesh_cols);
+        mesh_pts = dedup.points;
+        mesh_cols = dedup.colors;
+    }
+
+    if (mesh_pts.len < 3) {
+        return .{
+            .points = mesh_pts,
+            .colors = mesh_cols,
+            .faces = try allocator.alloc(Triangle, 0),
+        };
+    }
+
+    const pts2d = try allocator.alloc(Vec2, mesh_pts.len);
     defer allocator.free(pts2d);
-    for (filtered.points, 0..) |pt, i| {
+    for (mesh_pts, 0..) |pt, i| {
         const d = pt.sub(basis.origin);
         pts2d[i] = Vec2.init(d.dot(basis.u), d.dot(basis.v));
     }
@@ -76,17 +98,30 @@ pub fn buildColoredMesh(
     const raw_faces = try triangulateDelaunay2D(allocator, pts2d);
     defer allocator.free(raw_faces);
 
-    // 4. Prune triangles spanning depth jumps or empty gaps using 3D median NN distance
-    const max_edge = filtered.median_nn * config.max_edge_factor;
+    // 4. Compute median 3D edge length on the deduplicated mesh itself to prune only true gap/jump edges
+    var edge_lens: std.ArrayList(f64) = .empty;
+    defer edge_lens.deinit(allocator);
+    try edge_lens.ensureTotalCapacity(allocator, raw_faces.len * 3);
+    for (raw_faces) |tri| {
+        const a = mesh_pts[tri[0]];
+        const b = mesh_pts[tri[1]];
+        const c = mesh_pts[tri[2]];
+        try edge_lens.append(allocator, b.sub(a).norm());
+        try edge_lens.append(allocator, c.sub(b).norm());
+        try edge_lens.append(allocator, a.sub(c).norm());
+    }
+    std.mem.sort(f64, edge_lens.items, {}, std.sort.asc(f64));
+    const med_edge = if (edge_lens.items.len > 0) edge_lens.items[edge_lens.items.len / 2] else 1.0;
+    const max_edge = @max(med_edge * config.max_edge_factor, 1e-6);
     const max_edge_sq = max_edge * max_edge;
 
     var faces: std.ArrayList(Triangle) = .empty;
     errdefer faces.deinit(allocator);
 
     for (raw_faces) |tri| {
-        const a = filtered.points[tri[0]];
-        const b = filtered.points[tri[1]];
-        const c = filtered.points[tri[2]];
+        const a = mesh_pts[tri[0]];
+        const b = mesh_pts[tri[1]];
+        const c = mesh_pts[tri[2]];
 
         const ab = b.sub(a);
         const bc = c.sub(b);
@@ -112,11 +147,100 @@ pub fn buildColoredMesh(
         }
     }
 
+    const out_faces = try faces.toOwnedSlice(allocator);
+    if (config.laplacian_iters > 0 and out_faces.len > 0) {
+        try smoothMeshVertices(allocator, mesh_pts, out_faces, config.laplacian_iters, 0.4);
+    }
+
     return .{
-        .points = filtered.points,
-        .colors = filtered.colors,
-        .faces = try faces.toOwnedSlice(allocator),
+        .points = mesh_pts,
+        .colors = mesh_cols,
+        .faces = out_faces,
     };
+}
+
+const CellKey2D = struct {
+    x: i32,
+    y: i32,
+};
+
+const CellBest = struct {
+    idx: usize,
+    depth: f64,
+};
+
+fn frontSurfaceDedup2D(
+    allocator: std.mem.Allocator,
+    points: []const Vec3,
+    colors: []const Color,
+    basis: ViewBasis,
+    cell_size: f64,
+) !struct { points: []Vec3, colors: []Color } {
+    var grid = std.AutoHashMap(CellKey2D, CellBest).init(allocator);
+    defer grid.deinit();
+
+    const inv_c = 1.0 / cell_size;
+    for (points, 0..) |pt, i| {
+        const d = pt.sub(basis.origin);
+        const u = d.dot(basis.u);
+        const v = d.dot(basis.v);
+        const depth = d.dot(basis.forward);
+        const key = CellKey2D{
+            .x = @intFromFloat(@floor(u * inv_c)),
+            .y = @intFromFloat(@floor(v * inv_c)),
+        };
+        const gop = try grid.getOrPut(key);
+        if (!gop.found_existing or depth < gop.value_ptr.depth) {
+            gop.value_ptr.* = .{ .idx = i, .depth = depth };
+        }
+    }
+
+    const out_pts = try allocator.alloc(Vec3, grid.count());
+    errdefer allocator.free(out_pts);
+    const out_cols = try allocator.alloc(Color, grid.count());
+
+    var it = grid.valueIterator();
+    var out_i: usize = 0;
+    while (it.next()) |best| : (out_i += 1) {
+        out_pts[out_i] = points[best.idx];
+        out_cols[out_i] = colors[best.idx];
+    }
+    return .{ .points = out_pts, .colors = out_cols };
+}
+
+fn smoothMeshVertices(
+    allocator: std.mem.Allocator,
+    points: []Vec3,
+    faces: []const Triangle,
+    iters: usize,
+    lambda: f64,
+) !void {
+    const accum = try allocator.alloc(Vec3, points.len);
+    defer allocator.free(accum);
+    const counts = try allocator.alloc(u32, points.len);
+    defer allocator.free(counts);
+
+    for (0..iters) |_| {
+        @memset(accum, Vec3.zero);
+        @memset(counts, 0);
+
+        for (faces) |f| {
+            const pairs = [3][2]usize{ .{ f[0], f[1] }, .{ f[1], f[2] }, .{ f[2], f[0] } };
+            for (pairs) |e| {
+                accum[e[0]] = accum[e[0]].add(points[e[1]]);
+                counts[e[0]] += 1;
+                accum[e[1]] = accum[e[1]].add(points[e[0]]);
+                counts[e[1]] += 1;
+            }
+        }
+
+        for (points, accum, counts) |*pt, sum, cnt| {
+            if (cnt > 0) {
+                const avg = sum.scale(1.0 / @as(f64, @floatFromInt(cnt)));
+                pt.* = pt.*.add(avg.sub(pt.*).scale(lambda));
+            }
+        }
+    }
 }
 
 const FilteredPoints = struct {
@@ -147,23 +271,48 @@ fn filterStructurePoints(
     const nn1_dists = try allocator.alloc(f64, n);
     defer allocator.free(nn1_dists);
 
+    // Sort indices by X so k-NN search can early-exit in both directions
+    const order = try allocator.alloc(usize, n);
+    defer allocator.free(order);
+    for (0..n) |i| order[i] = i;
+    std.mem.sort(usize, order, points, struct {
+        fn cmp(pts: []const Vec3, a: usize, b: usize) bool {
+            return pts[a].x < pts[b].x;
+        }
+    }.cmp);
+
     const topk = try allocator.alloc(f64, k);
     defer allocator.free(topk);
 
-    for (0..n) |i| {
+    for (0..n) |pos_i| {
+        const i = order[pos_i];
         @memset(topk, std.math.inf(f64));
         const pi = points[i];
-        for (0..n) |j| {
-            if (i == j) continue;
+
+        // Scan right
+        var pos_r = pos_i + 1;
+        while (pos_r < n) : (pos_r += 1) {
+            const j = order[pos_r];
+            const dx = points[j].x - pi.x;
+            if (dx * dx >= topk[k - 1]) break;
             const d_sq = pi.sub(points[j]).normSq();
             if (d_sq < topk[k - 1]) {
-                topk[k - 1] = d_sq;
-                var pos: usize = k - 1;
-                while (pos > 0 and topk[pos] < topk[pos - 1]) : (pos -= 1) {
-                    std.mem.swap(f64, &topk[pos], &topk[pos - 1]);
-                }
+                insertTopK(topk, d_sq);
             }
         }
+        // Scan left
+        var pos_l = pos_i;
+        while (pos_l > 0) {
+            pos_l -= 1;
+            const j = order[pos_l];
+            const dx = pi.x - points[j].x;
+            if (dx * dx >= topk[k - 1]) break;
+            const d_sq = pi.sub(points[j]).normSq();
+            if (d_sq < topk[k - 1]) {
+                insertTopK(topk, d_sq);
+            }
+        }
+
         nn1_dists[i] = @sqrt(topk[0]);
         var sum: f64 = 0;
         for (topk) |d_sq| sum += @sqrt(d_sq);
@@ -207,6 +356,14 @@ fn filterStructurePoints(
     };
 }
 
+fn insertTopK(topk: []f64, d_sq: f64) void {
+    topk[topk.len - 1] = d_sq;
+    var pos: usize = topk.len - 1;
+    while (pos > 0 and topk[pos] < topk[pos - 1]) : (pos -= 1) {
+        std.mem.swap(f64, &topk[pos], &topk[pos - 1]);
+    }
+}
+
 const ViewBasis = struct {
     origin: Vec3,
     u: Vec3,
@@ -242,7 +399,7 @@ const BWTriangle = struct {
     cx: f64,
     cy: f64,
     r_sq: f64,
-    active: bool,
+    max_x: f64,
 };
 
 fn makeBWTriangle(pts: []const Vec2, v0: usize, v1: usize, v2: usize) BWTriangle {
@@ -259,7 +416,7 @@ fn makeBWTriangle(pts: []const Vec2, v0: usize, v1: usize, v2: usize) BWTriangle
 
     const d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
     if (@abs(d) < 1e-15) {
-        return .{ .v = .{ v0, v1, v2 }, .cx = 0, .cy = 0, .r_sq = -1.0, .active = true };
+        return .{ .v = .{ v0, v1, v2 }, .cx = 0, .cy = 0, .r_sq = -1.0, .max_x = -std.math.inf(f64) };
     }
 
     const a2 = ax * ax + ay * ay;
@@ -270,16 +427,17 @@ fn makeBWTriangle(pts: []const Vec2, v0: usize, v1: usize, v2: usize) BWTriangle
     const uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
     const dx = ax - ux;
     const dy = ay - uy;
+    const r_sq = dx * dx + dy * dy;
     return .{
         .v = .{ v0, v1, v2 },
         .cx = ux,
         .cy = uy,
-        .r_sq = dx * dx + dy * dy,
-        .active = true,
+        .r_sq = r_sq,
+        .max_x = ux + @sqrt(r_sq),
     };
 }
 
-/// Bowyer-Watson 2D Delaunay triangulation.
+/// Bowyer-Watson 2D Delaunay triangulation using X-sorted sweep-front pruning.
 pub fn triangulateDelaunay2D(allocator: std.mem.Allocator, pts: []const Vec2) ![]Triangle {
     if (pts.len < 3) return try allocator.alloc(Triangle, 0);
 
@@ -309,31 +467,67 @@ pub fn triangulateDelaunay2D(allocator: std.mem.Allocator, pts: []const Vec2) ![
     all_pts[n + 1] = Vec2.init(mid_x, mid_y + 20.0 * delta_max);
     all_pts[n + 2] = Vec2.init(mid_x + 20.0 * delta_max, mid_y - delta_max);
 
-    var tris: std.ArrayList(BWTriangle) = .empty;
-    defer tris.deinit(allocator);
-    try tris.append(allocator, makeBWTriangle(all_pts, n, n + 1, n + 2));
+    // Sort point indices by (X, Y) ascending so circumcircles left of p.x can be retired permanently
+    const order = try allocator.alloc(usize, n);
+    defer allocator.free(order);
+    for (0..n) |i| order[i] = i;
+    std.mem.sort(usize, order, pts, struct {
+        fn cmp(p_slice: []const Vec2, a: usize, b: usize) bool {
+            if (p_slice[a].x != p_slice[b].x) return p_slice[a].x < p_slice[b].x;
+            return p_slice[a].y < p_slice[b].y;
+        }
+    }.cmp);
 
-    var bad_indices: std.ArrayList(usize) = .empty;
-    defer bad_indices.deinit(allocator);
+    const dup_eps_sq = (delta_max * 1e-7) * (delta_max * 1e-7);
+
+    var active_tris: std.ArrayList(BWTriangle) = .empty;
+    defer active_tris.deinit(allocator);
+    try active_tris.append(allocator, makeBWTriangle(all_pts, n, n + 1, n + 2));
+
+    var out: std.ArrayList(Triangle) = .empty;
+    errdefer out.deinit(allocator);
+
+    var bad_tris: std.ArrayList(BWTriangle) = .empty;
+    defer bad_tris.deinit(allocator);
     var edges: std.ArrayList([2]usize) = .empty;
     defer edges.deinit(allocator);
 
-    for (0..n) |p_idx| {
+    var prev_inserted: ?Vec2 = null;
+    for (order) |p_idx| {
         const p = all_pts[p_idx];
-        bad_indices.clearRetainingCapacity();
+        if (prev_inserted) |prev_p| {
+            if (p.sub(prev_p).normSq() <= dup_eps_sq) continue;
+        }
+        prev_inserted = p;
+        bad_tris.clearRetainingCapacity();
 
-        for (tris.items, 0..) |t, t_idx| {
-            if (!t.active or t.r_sq < 0) continue;
+        var t_idx: usize = 0;
+        while (t_idx < active_tris.items.len) {
+            const t = active_tris.items[t_idx];
+            if (t.r_sq < 0) {
+                _ = active_tris.swapRemove(t_idx);
+                continue;
+            }
+            if (t.max_x < p.x - 1e-9) {
+                if (t.v[0] < n and t.v[1] < n and t.v[2] < n) {
+                    try out.append(allocator, t.v);
+                }
+                _ = active_tris.swapRemove(t_idx);
+                continue;
+            }
             const ex = p.x - t.cx;
             const ey = p.y - t.cy;
             if (ex * ex + ey * ey <= t.r_sq + 1e-12) {
-                try bad_indices.append(allocator, t_idx);
+                try bad_tris.append(allocator, t);
+                _ = active_tris.swapRemove(t_idx);
+                continue;
             }
+            t_idx += 1;
         }
 
         edges.clearRetainingCapacity();
-        for (bad_indices.items) |b_idx| {
-            const tv = tris.items[b_idx].v;
+        for (bad_tris.items, 0..) |bt, b_idx| {
+            const tv = bt.v;
             const tri_edges = [3][2]usize{
                 .{ tv[0], tv[1] },
                 .{ tv[1], tv[2] },
@@ -341,10 +535,9 @@ pub fn triangulateDelaunay2D(allocator: std.mem.Allocator, pts: []const Vec2) ![
             };
             for (tri_edges) |e| {
                 var shared = false;
-                for (bad_indices.items) |other_idx| {
+                for (bad_tris.items, 0..) |other_bt, other_idx| {
                     if (other_idx == b_idx) continue;
-                    const ov = tris.items[other_idx].v;
-                    if (triHasEdge(ov, e[0], e[1])) {
+                    if (triHasEdge(other_bt.v, e[0], e[1])) {
                         shared = true;
                         break;
                     }
@@ -355,32 +548,14 @@ pub fn triangulateDelaunay2D(allocator: std.mem.Allocator, pts: []const Vec2) ![
             }
         }
 
-        for (bad_indices.items) |b_idx| {
-            tris.items[b_idx].active = false;
-        }
-
-        // Reuse inactive slots before appending
-        var e_idx: usize = 0;
-        for (tris.items) |*t| {
-            if (e_idx >= edges.items.len) break;
-            if (!t.active) {
-                const e = edges.items[e_idx];
-                t.* = makeBWTriangle(all_pts, e[0], e[1], p_idx);
-                e_idx += 1;
-            }
-        }
-        while (e_idx < edges.items.len) : (e_idx += 1) {
-            const e = edges.items[e_idx];
-            try tris.append(allocator, makeBWTriangle(all_pts, e[0], e[1], p_idx));
+        for (edges.items) |e| {
+            try active_tris.append(allocator, makeBWTriangle(all_pts, e[0], e[1], p_idx));
         }
     }
 
-    var out: std.ArrayList(Triangle) = .empty;
-    errdefer out.deinit(allocator);
-    for (tris.items) |t| {
-        if (!t.active) continue;
-        if (t.v[0] >= n or t.v[1] >= n or t.v[2] >= n) continue;
+    for (active_tris.items) |t| {
         if (t.r_sq < 0) continue;
+        if (t.v[0] >= n or t.v[1] >= n or t.v[2] >= n) continue;
         try out.append(allocator, t.v);
     }
     return try out.toOwnedSlice(allocator);
