@@ -2,6 +2,9 @@
 
 An end-to-end 3D Structure-from-Motion (SfM), textured surface meshing, WebGPU compute-accelerated, neural 3D Transformer hole-completion, and interactive OpenGL camera-viewer pipeline written in Zig.
 
+![Reconstructed 3D Fountain Mesh and Camera Frustums](assets/reconstruction.gif)
+*Reconstructed `fountain-p11` mesh (`934,393` vertices / `1,795,088` triangles) with all 11 recovered camera frustums (green) and MoGe-2 neural hole completion.*
+
 ## Overview
 
 Starting from a calibrated multi-view photo collection (`K.txt` + images), **`3d_reconstruction`** reconstructs camera poses, a sparse 3D point cloud, and a completed, photo-textured triangle mesh exported to ASCII `.ply`:
@@ -81,6 +84,8 @@ zig build -Doptimize=ReleaseFast
 - **`F` / `Esc` / `FREE ORBIT (F)`**: Return smoothly to Free Orbit mode.
 
 ## Benchmark Snapshot (`fountain-p11`, 11 images, `--threads 8`, `-Doptimize=ReleaseFast`)
+
+![Input vs Base SfM vs WebGPU + MoGe-2 ONNX](assets/comparison.png)
 
 | Configuration | Total Time (SfM) | Vertices / Triangles | Mean Coverage (11 cams) | PSNR | SSIM |
 | --- | --- | --- | --- | --- | --- |
