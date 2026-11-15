@@ -160,6 +160,37 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run performance benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const translate_gl = b.addTranslateC(.{
+        .root_source_file = b.path("src/c_gl.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const c_gl_mod = translate_gl.createModule();
+
+    const viewer_exe = b.addExecutable(.{
+        .name = "sfm_viewer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/viewer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "simple_3d_reconstruction", .module = mod },
+                .{ .name = "c_gl", .module = c_gl_mod },
+            },
+        }),
+    });
+    viewer_exe.root_module.linkSystemLibrary("glfw", .{});
+    viewer_exe.root_module.linkSystemLibrary("GL", .{});
+    viewer_exe.root_module.linkSystemLibrary("X11", .{});
+    b.installArtifact(viewer_exe);
+
+    const run_viewer = b.addRunArtifact(viewer_exe);
+    run_viewer.step.dependOn(b.getInstallStep());
+    run_viewer.addPassthruArgs();
+    const viewer_step = b.step("viewer", "Run native OpenGL mesh & camera viewer");
+    viewer_step.dependOn(&run_viewer.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

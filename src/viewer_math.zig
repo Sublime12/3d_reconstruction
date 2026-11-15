@@ -1,0 +1,440 @@
+const std = @import("std");
+const Vec3 = @import("math/vec.zig").Vec3;
+const Mat3 = @import("math/mat.zig").Mat3;
+const lie = @import("math/lie.zig");
+const CameraPose = lie.CameraPose;
+
+pub const Mat4 = struct {
+    // Column-major for OpenGL (element at col c, row r is m[c * 4 + r])
+    m: [16]f32,
+
+    pub const identity: Mat4 = .{ .m = .{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    } };
+
+    pub fn mul(a: Mat4, b: Mat4) Mat4 {
+        var out: [16]f32 = undefined;
+        for (0..4) |col| {
+            for (0..4) |row| {
+                var sum: f32 = 0.0;
+                for (0..4) |k| {
+                    sum += a.m[k * 4 + row] * b.m[col * 4 + k];
+                }
+                out[col * 4 + row] = sum;
+            }
+        }
+        return .{ .m = out };
+    }
+
+    pub fn mulVec4(a: Mat4, v: [4]f64) [4]f64 {
+        var out: [4]f64 = .{ 0, 0, 0, 0 };
+        for (0..4) |col| {
+            for (0..4) |row| {
+                out[row] += @as(f64, a.m[col * 4 + row]) * v[col];
+            }
+        }
+        return out;
+    }
+
+    pub fn inverse(mat: Mat4) ?Mat4 {
+        var m: [16]f64 = undefined;
+        for (0..16) |i| m[i] = mat.m[i];
+
+        var inv: [16]f64 = undefined;
+        inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] +
+            m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+        inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] -
+            m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+        inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] +
+            m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+        inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] -
+            m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+
+        inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] -
+            m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+        inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] +
+            m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+        inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] -
+            m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+        inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] +
+            m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+
+        inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] +
+            m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+        inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] -
+            m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+        inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] +
+            m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+        inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] -
+            m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+
+        inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] -
+            m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+        inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] +
+            m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+        inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] -
+            m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+        inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] +
+            m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+        const det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+        if (@abs(det) < 1e-18) return null;
+        const inv_det = 1.0 / det;
+
+        var out: [16]f32 = undefined;
+        for (0..16) |i| out[i] = @floatCast(inv[i] * inv_det);
+        return .{ .m = out };
+    }
+};
+
+pub const FittedPhotoRect = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    scale: f64,
+};
+
+pub fn fitImageToWindow(win_w: f64, win_h: f64, img_w: f64, img_h: f64) FittedPhotoRect {
+    const scale = @min(win_w / @max(1.0, img_w), win_h / @max(1.0, img_h));
+    const drawn_w = img_w * scale;
+    const drawn_h = img_h * scale;
+    return .{
+        .x = @floatCast((win_w - drawn_w) * 0.5),
+        .y = @floatCast((win_h - drawn_h) * 0.5),
+        .w = @floatCast(drawn_w),
+        .h = @floatCast(drawn_h),
+        .scale = scale,
+    };
+}
+
+/// Build OpenGL clip-space projection matching SfM camera convention (+X right, +Y down, +Z forward)
+/// scaled to fit `(img_w, img_h)` inside window `(win_w, win_h)` while filling the full viewport.
+pub fn buildProjectionFromK(
+    k: Mat3,
+    img_w: f64,
+    img_h: f64,
+    win_w: f64,
+    win_h: f64,
+    near_z: f64,
+    far_z: f64,
+) Mat4 {
+    const fit = fitImageToWindow(win_w, win_h, img_w, img_h);
+    const fx_w = k.m[0][0] * fit.scale;
+    const fy_w = k.m[1][1] * fit.scale;
+    const cx_w = (k.m[0][2] - img_w * 0.5) * fit.scale + win_w * 0.5;
+    const cy_w = (k.m[1][2] - img_h * 0.5) * fit.scale + win_h * 0.5;
+
+    const a: f32 = @floatCast(2.0 * fx_w / win_w);
+    const b: f32 = @floatCast(-2.0 * fy_w / win_h);
+    const c_x: f32 = @floatCast(2.0 * cx_w / win_w - 1.0);
+    const c_y: f32 = @floatCast(1.0 - 2.0 * cy_w / win_h);
+    const p_z: f32 = @floatCast((far_z + near_z) / (far_z - near_z));
+    const q_z: f32 = @floatCast(-2.0 * far_z * near_z / (far_z - near_z));
+
+    return .{ .m = .{
+        a,   0,   0,   0,
+        0,   b,   0,   0,
+        c_x, c_y, p_z, 1,
+        0,   0,   q_z, 0,
+    } };
+}
+
+pub fn poseToViewMatrix(pose: CameraPose) Mat4 {
+    return .{ .m = .{
+        @floatCast(pose.r.m[0][0]), @floatCast(pose.r.m[1][0]), @floatCast(pose.r.m[2][0]), 0,
+        @floatCast(pose.r.m[0][1]), @floatCast(pose.r.m[1][1]), @floatCast(pose.r.m[2][1]), 0,
+        @floatCast(pose.r.m[0][2]), @floatCast(pose.r.m[1][2]), @floatCast(pose.r.m[2][2]), 0,
+        @floatCast(pose.t.x),       @floatCast(pose.t.y),       @floatCast(pose.t.z),       1,
+    } };
+}
+
+pub const OrbitFrame = struct {
+    target: Vec3,
+    world_up: Vec3,
+    base_fwd: Vec3,
+    base_right: Vec3,
+    yaw: f64,
+    pitch: f64,
+    dist: f64,
+
+    pub fn fromScene(points: []const Vec3, poses: []const CameraPose) OrbitFrame {
+        var mean_pt = Vec3.zero;
+        if (points.len > 0) {
+            for (points) |p| mean_pt = mean_pt.add(p);
+            mean_pt = mean_pt.scale(1.0 / @as(f64, @floatFromInt(points.len)));
+        }
+
+        var avg_up = Vec3.zero;
+        var avg_fwd = Vec3.zero;
+        var avg_cam = Vec3.zero;
+        if (poses.len > 0) {
+            for (poses) |p| {
+                const rt = p.r.transpose();
+                avg_up = avg_up.add(rt.mulVec(Vec3.init(0, -1, 0)));
+                avg_fwd = avg_fwd.add(rt.mulVec(Vec3.init(0, 0, 1)));
+                avg_cam = avg_cam.add(p.cameraCenter());
+            }
+            avg_up = avg_up.normalize();
+            avg_fwd = avg_fwd.normalize();
+            avg_cam = avg_cam.scale(1.0 / @as(f64, @floatFromInt(poses.len)));
+        } else {
+            avg_up = Vec3.init(0, -1, 0);
+            avg_fwd = Vec3.init(0, 0, 1);
+            avg_cam = Vec3.init(0, 0, -5);
+        }
+
+        // Orthogonalize base_fwd to world_up
+        var fwd = avg_fwd.sub(avg_up.scale(avg_fwd.dot(avg_up)));
+        if (fwd.norm() < 1e-4) fwd = Vec3.init(0, 0, 1);
+        fwd = fwd.normalize();
+        const right = fwd.cross(avg_up).normalize();
+
+        const span_dist = if (poses.len > 0) @max(2.0, mean_pt.sub(avg_cam).norm() * 1.15) else 6.0;
+
+        return .{
+            .target = mean_pt,
+            .world_up = avg_up,
+            .base_fwd = fwd,
+            .base_right = right,
+            .yaw = 0.28,
+            .pitch = 0.28,
+            .dist = span_dist,
+        };
+    }
+
+    pub fn toPose(self: OrbitFrame) CameraPose {
+        const cy = @cos(self.yaw);
+        const sy = @sin(self.yaw);
+        const cp = @cos(self.pitch);
+        const sp = @sin(self.pitch);
+
+        const fwd_h = self.base_fwd.scale(cy).add(self.base_right.scale(sy)).normalize();
+        const right = fwd_h.cross(self.world_up).normalize();
+        const cam_fwd = fwd_h.scale(cp).sub(self.world_up.scale(sp)).normalize();
+        const cam_down = cam_fwd.cross(right).normalize();
+
+        const r = Mat3{ .m = .{
+            .{ right.x, right.y, right.z },
+            .{ cam_down.x, cam_down.y, cam_down.z },
+            .{ cam_fwd.x, cam_fwd.y, cam_fwd.z },
+        } };
+        const eye = self.target.sub(cam_fwd.scale(self.dist));
+        return .{
+            .r = r,
+            .t = r.mulVec(eye).neg(),
+        };
+    }
+
+    pub fn pan(self: *OrbitFrame, dx_norm: f64, dy_norm: f64) void {
+        const pose = self.toPose();
+        const right = Vec3.init(pose.r.m[0][0], pose.r.m[0][1], pose.r.m[0][2]);
+        const down = Vec3.init(pose.r.m[1][0], pose.r.m[1][1], pose.r.m[1][2]);
+        const scale = self.dist * 0.8;
+        self.target = self.target
+            .sub(right.scale(dx_norm * scale))
+            .sub(down.scale(dy_norm * scale));
+    }
+};
+
+pub const Ray = struct {
+    origin: Vec3,
+    dir: Vec3,
+};
+
+pub fn screenPointToRay(
+    mx: f64,
+    my: f64,
+    win_w: f64,
+    win_h: f64,
+    proj: Mat4,
+    view: Mat4,
+) ?Ray {
+    const inv_vp = proj.mul(view).inverse() orelse return null;
+    const x_ndc = (2.0 * mx / win_w) - 1.0;
+    const y_ndc = 1.0 - (2.0 * my / win_h);
+
+    const p_near_clip = inv_vp.mulVec4(.{ x_ndc, y_ndc, -1.0, 1.0 });
+    const p_far_clip = inv_vp.mulVec4(.{ x_ndc, y_ndc, 1.0, 1.0 });
+    if (@abs(p_near_clip[3]) < 1e-12 or @abs(p_far_clip[3]) < 1e-12) return null;
+
+    const p_near = Vec3.init(
+        p_near_clip[0] / p_near_clip[3],
+        p_near_clip[1] / p_near_clip[3],
+        p_near_clip[2] / p_near_clip[3],
+    );
+    const p_far = Vec3.init(
+        p_far_clip[0] / p_far_clip[3],
+        p_far_clip[1] / p_far_clip[3],
+        p_far_clip[2] / p_far_clip[3],
+    );
+    const diff = p_far.sub(p_near);
+    if (diff.norm() < 1e-12) return null;
+    return .{
+        .origin = p_near,
+        .dir = diff.normalize(),
+    };
+}
+
+pub fn raySphereIntersect(ray: Ray, center: Vec3, radius: f64) ?f64 {
+    const oc = ray.origin.sub(center);
+    const b = oc.dot(ray.dir);
+    const c = oc.dot(oc) - radius * radius;
+    const disc = b * b - c;
+    if (disc < 0.0) return null;
+    const sq = @sqrt(disc);
+    const t0 = -b - sq;
+    if (t0 > 0.0) return t0;
+    const t1 = -b + sq;
+    if (t1 > 0.0) return t1;
+    return null;
+}
+
+pub fn pickCamera(
+    ray: Ray,
+    poses: []const CameraPose,
+    registered: []const bool,
+    hit_radius: f64,
+) ?usize {
+    var best_idx: ?usize = null;
+    var best_t: f64 = std.math.inf(f64);
+    for (poses, registered, 0..) |pose, is_reg, idx| {
+        if (!is_reg) continue;
+        const c = pose.cameraCenter();
+        if (raySphereIntersect(ray, c, hit_radius)) |t| {
+            if (t < best_t) {
+                best_t = t;
+                best_idx = idx;
+            }
+        }
+    }
+    return best_idx;
+}
+
+pub const UiButton = struct {
+    id: i32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    label: []const u8,
+    active: bool = false,
+
+    pub fn contains(self: UiButton, mx: f64, my: f64) bool {
+        return mx >= self.x and mx <= self.x + self.w and my >= self.y and my <= self.y + self.h;
+    }
+};
+
+/// Minimal 5x7 bitmap glyph rows (5 bits per row, MSB = left pixel) for crisp HUD text
+pub fn glyph5x7(ch: u8) [7]u8 {
+    return switch (ch) {
+        '0' => .{ 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E },
+        '1' => .{ 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E },
+        '2' => .{ 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F },
+        '3' => .{ 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E },
+        '4' => .{ 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 },
+        '5' => .{ 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E },
+        '6' => .{ 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E },
+        '7' => .{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
+        '8' => .{ 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E },
+        '9' => .{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C },
+        'A', 'a' => .{ 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+        'B', 'b' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E },
+        'C', 'c' => .{ 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E },
+        'D', 'd' => .{ 0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C },
+        'E', 'e' => .{ 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F },
+        'F', 'f' => .{ 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 },
+        'G', 'g' => .{ 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F },
+        'H', 'h' => .{ 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+        'I', 'i' => .{ 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E },
+        'J', 'j' => .{ 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C },
+        'K', 'k' => .{ 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 },
+        'L', 'l' => .{ 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F },
+        'M', 'm' => .{ 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 },
+        'N', 'n' => .{ 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 },
+        'O', 'o' => .{ 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+        'P', 'p' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 },
+        'Q', 'q' => .{ 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D },
+        'R', 'r' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 },
+        'S', 's' => .{ 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E },
+        'T', 't' => .{ 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+        'U', 'u' => .{ 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+        'V', 'v' => .{ 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 },
+        'W', 'w' => .{ 0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11 },
+        'X', 'x' => .{ 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 },
+        'Y', 'y' => .{ 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 },
+        'Z', 'z' => .{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F },
+        ':' => .{ 0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00 },
+        '.' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C },
+        '-' => .{ 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 },
+        '+' => .{ 0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00 },
+        '/' => .{ 0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10 },
+        '%' => .{ 0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03 },
+        '(' => .{ 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02 },
+        ')' => .{ 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 },
+        '[' => .{ 0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E },
+        ']' => .{ 0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E },
+        '|' => .{ 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+        else => .{ 0, 0, 0, 0, 0, 0, 0 },
+    };
+}
+
+test "buildProjectionFromK and poseToViewMatrix match lie.projectPoint" {
+    const k = Mat3{ .m = .{
+        .{ 1000.0, 0.0, 600.0 },
+        .{ 0.0, 1000.0, 400.0 },
+        .{ 0.0, 0.0, 1.0 },
+    } };
+    const r = lie.so3Exp(Vec3.init(0.1, -0.2, 0.05));
+    const pose = CameraPose{ .r = r, .t = Vec3.init(0.3, -0.1, 2.0) };
+    const pt = Vec3.init(0.4, -0.2, 4.5);
+
+    const uv_ref = lie.projectPoint(k, pose, pt).?;
+
+    const proj = buildProjectionFromK(k, 1200.0, 800.0, 1200.0, 800.0, 0.1, 100.0);
+    const view = poseToViewMatrix(pose);
+    const clip = proj.mul(view).mulVec4(.{ pt.x, pt.y, pt.z, 1.0 });
+
+    const x_ndc = clip[0] / clip[3];
+    const y_ndc = clip[1] / clip[3];
+    const u_gl = (x_ndc + 1.0) * 0.5 * 1200.0;
+    const v_gl = (1.0 - y_ndc) * 0.5 * 800.0;
+
+    try std.testing.expectApproxEqAbs(uv_ref.x, u_gl, 1e-3);
+    try std.testing.expectApproxEqAbs(uv_ref.y, v_gl, 1e-3);
+}
+
+test "screenPointToRay and pickCamera select the clicked camera" {
+    const k = Mat3{ .m = .{
+        .{ 800.0, 0.0, 400.0 },
+        .{ 0.0, 800.0, 300.0 },
+        .{ 0.0, 0.0, 1.0 },
+    } };
+    const cam_a = CameraPose{ .r = Mat3.identity, .t = Vec3.init(2.0, 0.0, -5.0) }; // center (-2, 0, 5)
+    const cam_b = CameraPose{ .r = Mat3.identity, .t = Vec3.init(-2.0, 0.0, -5.0) }; // center (+2, 0, 5)
+    const poses = [_]CameraPose{ cam_a, cam_b };
+    const reg = [_]bool{ true, true };
+
+    const viewer_pose = CameraPose.identity;
+    const proj = buildProjectionFromK(k, 800.0, 600.0, 800.0, 600.0, 0.1, 100.0);
+    const view = poseToViewMatrix(viewer_pose);
+
+    const uv_b = lie.projectPoint(k, viewer_pose, cam_b.cameraCenter()).?;
+    const ray = screenPointToRay(uv_b.x, uv_b.y, 800.0, 600.0, proj, view).?;
+    const hit = pickCamera(ray, &poses, &reg, 0.35);
+    try std.testing.expectEqual(@as(?usize, 1), hit);
+}
+
+test "OrbitFrame keeps camera looking at target" {
+    const pts = [_]Vec3{Vec3.init(0, 0, 5)};
+    const poses = [_]CameraPose{CameraPose.identity};
+    const orbit = OrbitFrame.fromScene(&pts, &poses);
+    const p = orbit.toPose();
+    const xc = p.transformPoint(orbit.target);
+    try std.testing.expectApproxEqAbs(0.0, xc.x, 1e-5);
+    try std.testing.expectApproxEqAbs(0.0, xc.y, 1e-5);
+    try std.testing.expectApproxEqAbs(orbit.dist, xc.z, 1e-5);
+}

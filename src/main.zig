@@ -86,8 +86,14 @@ pub fn main(init: std.process.Init) !void {
 
     var reg_poses: std.ArrayList(sfm.lie.CameraPose) = .empty;
     defer reg_poses.deinit(gpa);
-    for (result.poses, result.registered) |p, is_reg| {
-        if (is_reg) try reg_poses.append(gpa, p);
+    var cam_metas: std.ArrayList(sfm.io_ply.CameraMeta) = .empty;
+    defer cam_metas.deinit(gpa);
+    for (result.poses, result.registered, img_names.items) |p, is_reg, name| {
+        if (is_reg) {
+            try reg_poses.append(gpa, p);
+            const rel_img = try std.fmt.allocPrint(arena, "{s}/{s}", .{ data_dir, name });
+            try cam_metas.append(gpa, .{ .pose = p, .image_path = rel_img });
+        }
     }
 
     std.log.info("Building colored surface mesh from {d} sparse points...", .{result.points.len});
@@ -105,12 +111,18 @@ pub fn main(init: std.process.Init) !void {
         2,
     );
 
-    const ply_bytes = try sfm.io_ply.formatPlyMesh(
+    const ply_bytes = try sfm.io_ply.formatPlyMeshWithMeta(
         gpa,
         colored_mesh.points,
         colored_mesh.colors,
         colored_mesh.faces,
         reg_poses.items,
+        .{
+            .k = k,
+            .img_w = images[0].width,
+            .img_h = images[0].height,
+            .cameras = cam_metas.items,
+        },
     );
     defer gpa.free(ply_bytes);
 

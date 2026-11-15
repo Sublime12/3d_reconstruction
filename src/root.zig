@@ -14,6 +14,7 @@ pub const pipeline = @import("pipeline.zig");
 pub const mesh = @import("mesh.zig");
 pub const dense = @import("dense.zig");
 pub const render = @import("render.zig");
+pub const viewer_math = @import("viewer_math.zig");
 
 pub const CliOptions = struct {
     data_dir: []const u8 = "data/fountain-p11",
