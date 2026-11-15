@@ -71,11 +71,12 @@ def main():
 
     fig.update_layout(
         title=f"SfM Reconstruction ({len(xs)} points, {len(cxs)} cameras)",
+        template="plotly_dark",
         scene=dict(aspectmode="data"),
         margin=dict(l=0, r=0, b=0, t=40),
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(str(args.out), auto_open=True)
+    fig.write_html(str(args.out), auto_open=False)
     print(f"Wrote {args.out}")
 
 

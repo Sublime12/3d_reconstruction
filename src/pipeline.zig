@@ -31,13 +31,13 @@ pub const PairwiseVerified = struct {
 };
 
 pub const SfmConfig = struct {
-    max_keypoints: usize = 1500,
-    match_ratio: f64 = 0.78,
-    max_hamming: u32 = 64,
+    max_keypoints: usize = 4500,
+    match_ratio: f64 = 0.80,
+    max_hamming: u32 = 72,
     ransac_iters: usize = 300,
     ransac_thresh_px: f64 = 2.0,
     reproj_thresh_px: f64 = 3.0,
-    min_triang_angle_rad: f64 = 0.02, // ~1.15 deg
+    min_triang_angle_rad: f64 = 0.03, // ~1.7 deg
     seed: u64 = 42,
     /// 1 = single-threaded CPU, 0 = auto-detect CPU core count, >1 = explicit thread count
     num_threads: usize = 1,

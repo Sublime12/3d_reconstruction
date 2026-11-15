@@ -110,13 +110,13 @@ pub fn detectAndCompute(
             const det_m = sxx * syy - sxy * sxy;
             const trace_m = sxx + syy;
             const r = det_m - 0.04 * trace_m * trace_m;
-            if (r > 1e5) {
+            if (r > 1e4) {
                 score[y * w + x] = r;
             }
         }
     }
 
-    // Non-maximum suppression in 7x7 neighborhood
+    // Non-maximum suppression in 5x5 neighborhood
     var candidates: std.ArrayList(Keypoint) = .empty;
     defer candidates.deinit(allocator);
 
@@ -126,10 +126,10 @@ pub fn detectAndCompute(
             if (val <= 0) continue;
 
             var is_max = true;
-            var dy: isize = -3;
-            while (dy <= 3) : (dy += 1) {
-                var dx: isize = -3;
-                while (dx <= 3) : (dx += 1) {
+            var dy: isize = -2;
+            while (dy <= 2) : (dy += 1) {
+                var dx: isize = -2;
+                while (dx <= 2) : (dx += 1) {
                     if (dx == 0 and dy == 0) continue;
                     const ny: usize = @intCast(@as(isize, @intCast(y)) + dy);
                     const nx: usize = @intCast(@as(isize, @intCast(x)) + dx);
