@@ -766,7 +766,7 @@ pub fn main(init: std.process.Init) !void {
                 if (shift_down) {
                     orbit.pan(dx / win_w, dy / win_h);
                 } else {
-                    orbit.yaw -= dx * 0.006;
+                    orbit.yaw += dx * 0.006;
                     orbit.pitch = std.math.clamp(orbit.pitch + dy * 0.006, -1.45, 1.45);
                 }
                 current_pose = orbit.toPose();
