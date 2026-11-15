@@ -38,21 +38,42 @@ const brief_pairs: [256][4]i8 = blk: {
     break :blk pairs;
 };
 
-/// Detect Harris corners with non-maximum suppression and compute oriented 256-bit BRIEF descriptors.
+pub const TileConfig = struct {
+    grid_cols: usize = 24,
+    grid_rows: usize = 16,
+    min_harris_score: f32 = 250.0,
+    min_tile_dist_px: f64 = 3.5,
+};
+
+const Candidate = struct {
+    x: usize,
+    y: usize,
+    score: f32,
+};
+
 pub fn detectAndCompute(
     allocator: std.mem.Allocator,
     img: ImageView,
     max_keypoints: usize,
 ) ![]Keypoint {
+    return detectAndComputeWithConfig(allocator, img, max_keypoints, .{});
+}
+
+/// Detect Harris corners using spatially-uniform tiled selection and compute oriented 256-bit BRIEF descriptors.
+pub fn detectAndComputeWithConfig(
+    allocator: std.mem.Allocator,
+    img: ImageView,
+    max_keypoints: usize,
+    tile_cfg: TileConfig,
+) ![]Keypoint {
     const w: usize = img.width;
     const h: usize = img.height;
-    if (w < 40 or h < 40) return try allocator.alloc(Keypoint, 0);
+    if (w < 40 or h < 40 or max_keypoints == 0) return try allocator.alloc(Keypoint, 0);
 
     const n = w * h;
     const blurred = try gaussianBlur5x5(allocator, img.gray, w, h);
     defer allocator.free(blurred);
 
-    // Compute Sobel gradients and structure tensor components
     const ix2 = try allocator.alloc(f32, n);
     defer allocator.free(ix2);
     const iy2 = try allocator.alloc(f32, n);
@@ -86,12 +107,11 @@ pub fn detectAndCompute(
         }
     }
 
-    // Box-filter structure tensor (3x3 window) and compute Harris score: det(M) - 0.04 * trace(M)^2
     const score = try allocator.alloc(f32, n);
     defer allocator.free(score);
     @memset(score, 0);
 
-    const border: usize = 18;
+    const border: usize = 10;
     for (border..h - border) |y| {
         for (border..w - border) |x| {
             var sxx: f32 = 0;
@@ -110,17 +130,26 @@ pub fn detectAndCompute(
             const det_m = sxx * syy - sxy * sxy;
             const trace_m = sxx + syy;
             const r = det_m - 0.04 * trace_m * trace_m;
-            if (r > 1e4) {
+            if (r > tile_cfg.min_harris_score) {
                 score[y * w + x] = r;
             }
         }
     }
 
-    // Non-maximum suppression in 5x5 neighborhood
-    var candidates: std.ArrayList(Keypoint) = .empty;
-    defer candidates.deinit(allocator);
+    const cols = @max(@as(usize, 1), @min(tile_cfg.grid_cols, w / 24));
+    const rows = @max(@as(usize, 1), @min(tile_cfg.grid_rows, h / 24));
+    const n_tiles = cols * rows;
 
+    const tile_cands = try allocator.alloc(std.ArrayList(Candidate), n_tiles);
+    for (tile_cands) |*tc| tc.* = .empty;
+    defer {
+        for (tile_cands) |*tc| tc.deinit(allocator);
+        allocator.free(tile_cands);
+    }
+
+    // 5x5 NMS binned directly into spatial tiles
     for (border..h - border) |y| {
+        const ty = @min(rows - 1, (y * rows) / h);
         for (border..w - border) |x| {
             const val = score[y * w + x];
             if (val <= 0) continue;
@@ -142,48 +171,113 @@ pub fn detectAndCompute(
             }
             if (!is_max) continue;
 
-            // Intensity centroid orientation over radius 7
-            var m10: f64 = 0;
-            var m01: f64 = 0;
-            var oy: isize = -7;
-            while (oy <= 7) : (oy += 1) {
-                var ox: isize = -7;
-                while (ox <= 7) : (ox += 1) {
-                    if (ox * ox + oy * oy > 49) continue;
-                    const py: usize = @intCast(@as(isize, @intCast(y)) + oy);
-                    const px: usize = @intCast(@as(isize, @intCast(x)) + ox);
-                    const intensity: f64 = @floatFromInt(blurred[py * w + px]);
-                    m10 += @as(f64, @floatFromInt(ox)) * intensity;
-                    m01 += @as(f64, @floatFromInt(oy)) * intensity;
+            const tx = @min(cols - 1, (x * cols) / w);
+            try tile_cands[ty * cols + tx].append(allocator, .{ .x = x, .y = y, .score = val });
+        }
+    }
+
+    for (tile_cands) |*tc| {
+        std.mem.sort(Candidate, tc.items, {}, struct {
+            fn cmp(_: void, a: Candidate, b: Candidate) bool {
+                return a.score > b.score;
+            }
+        }.cmp);
+    }
+
+    const tile_sel = try allocator.alloc(std.ArrayList(Candidate), n_tiles);
+    for (tile_sel) |*ts| ts.* = .empty;
+    defer {
+        for (tile_sel) |*ts| ts.deinit(allocator);
+        allocator.free(tile_sel);
+    }
+    const tile_cursor = try allocator.alloc(usize, n_tiles);
+    defer allocator.free(tile_cursor);
+    @memset(tile_cursor, 0);
+
+    const min_dist_sq = tile_cfg.min_tile_dist_px * tile_cfg.min_tile_dist_px;
+    const base_quota = @max(@as(usize, 1), max_keypoints / n_tiles);
+
+    var selected: std.ArrayList(Candidate) = .empty;
+    defer selected.deinit(allocator);
+
+    // Stage 1: Give every tile up to base_quota well-spaced keypoints
+    for (0..n_tiles) |ti| {
+        const cands = tile_cands[ti].items;
+        var idx: usize = 0;
+        while (idx < cands.len and tile_sel[ti].items.len < base_quota and selected.items.len < max_keypoints) : (idx += 1) {
+            const c = cands[idx];
+            if (isWellSpaced(tile_sel[ti].items, c, min_dist_sq)) {
+                try tile_sel[ti].append(allocator, c);
+                try selected.append(allocator, c);
+            }
+        }
+        tile_cursor[ti] = idx;
+    }
+
+    // Stage 2: Round-robin remaining budget across tiles that still have spaced candidates
+    while (selected.items.len < max_keypoints) {
+        var added_any = false;
+        for (0..n_tiles) |ti| {
+            if (selected.items.len >= max_keypoints) break;
+            const cands = tile_cands[ti].items;
+            while (tile_cursor[ti] < cands.len) {
+                const c = cands[tile_cursor[ti]];
+                tile_cursor[ti] += 1;
+                if (isWellSpaced(tile_sel[ti].items, c, min_dist_sq)) {
+                    try tile_sel[ti].append(allocator, c);
+                    try selected.append(allocator, c);
+                    added_any = true;
+                    break;
                 }
             }
-            const angle = std.math.atan2(m01, m10);
-
-            try candidates.append(allocator, .{
-                .x = @floatFromInt(x),
-                .y = @floatFromInt(y),
-                .score = val,
-                .angle = angle,
-                .desc = .{ 0, 0, 0, 0 },
-            });
         }
+        if (!added_any) break;
     }
 
-    // Sort descending by Harris score and keep top max_keypoints
-    std.mem.sort(Keypoint, candidates.items, {}, struct {
-        fn cmp(_: void, a: Keypoint, b: Keypoint) bool {
-            return a.score > b.score;
-        }
-    }.cmp);
-
-    const keep = @min(candidates.items.len, max_keypoints);
-    const out = try allocator.alloc(Keypoint, keep);
-    for (0..keep) |i| {
-        var kp = candidates.items[i];
-        kp.desc = computeBrief(blurred, w, h, kp.x, kp.y, kp.angle);
-        out[i] = kp;
+    const out = try allocator.alloc(Keypoint, selected.items.len);
+    for (selected.items, 0..) |c, i| {
+        const angle = computeCentroidAngle(blurred, w, c.x, c.y);
+        const kx: f64 = @floatFromInt(c.x);
+        const ky: f64 = @floatFromInt(c.y);
+        out[i] = .{
+            .x = kx,
+            .y = ky,
+            .score = c.score,
+            .angle = angle,
+            .desc = computeBrief(blurred, w, h, kx, ky, angle),
+        };
     }
     return out;
+}
+
+fn isWellSpaced(existing: []const Candidate, cand: Candidate, min_dist_sq: f64) bool {
+    if (min_dist_sq <= 0) return true;
+    const cx: f64 = @floatFromInt(cand.x);
+    const cy: f64 = @floatFromInt(cand.y);
+    for (existing) |e| {
+        const dx = cx - @as(f64, @floatFromInt(e.x));
+        const dy = cy - @as(f64, @floatFromInt(e.y));
+        if (dx * dx + dy * dy < min_dist_sq) return false;
+    }
+    return true;
+}
+
+fn computeCentroidAngle(blurred: []const u8, w: usize, x: usize, y: usize) f64 {
+    var m10: f64 = 0;
+    var m01: f64 = 0;
+    var oy: isize = -7;
+    while (oy <= 7) : (oy += 1) {
+        var ox: isize = -7;
+        while (ox <= 7) : (ox += 1) {
+            if (ox * ox + oy * oy > 49) continue;
+            const py: usize = @intCast(@as(isize, @intCast(y)) + oy);
+            const px: usize = @intCast(@as(isize, @intCast(x)) + ox);
+            const intensity: f64 = @floatFromInt(blurred[py * w + px]);
+            m10 += @as(f64, @floatFromInt(ox)) * intensity;
+            m01 += @as(f64, @floatFromInt(oy)) * intensity;
+        }
+    }
+    return std.math.atan2(m01, m10);
 }
 
 fn computeBrief(img: []const u8, w: usize, h: usize, kx: f64, ky: f64, angle: f64) [4]u64 {
@@ -274,11 +368,17 @@ pub fn matchDescriptors(
 ) ![]Match {
     if (kps1.len == 0 or kps2.len < 2) return try allocator.alloc(Match, 0);
 
-    // Forward best & second-best: 1 -> 2
     const best_12 = try allocator.alloc(?usize, kps1.len);
     defer allocator.free(best_12);
     const best_dist_12 = try allocator.alloc(u32, kps1.len);
     defer allocator.free(best_dist_12);
+
+    const best_21 = try allocator.alloc(usize, kps2.len);
+    defer allocator.free(best_21);
+    const best_dist_21 = try allocator.alloc(u32, kps2.len);
+    defer allocator.free(best_dist_21);
+    @memset(best_21, 0);
+    @memset(best_dist_21, std.math.maxInt(u32));
 
     for (kps1, 0..) |kp1, i| {
         var d1: u32 = std.math.maxInt(u32);
@@ -293,6 +393,10 @@ pub fn matchDescriptors(
             } else if (d < d2) {
                 d2 = d;
             }
+            if (d < best_dist_21[j]) {
+                best_dist_21[j] = d;
+                best_21[j] = i;
+            }
         }
         if (d1 <= max_hamming and @as(f64, @floatFromInt(d1)) < ratio_thresh * @as(f64, @floatFromInt(d2))) {
             best_12[i] = b_idx;
@@ -300,22 +404,6 @@ pub fn matchDescriptors(
         } else {
             best_12[i] = null;
         }
-    }
-
-    // Reverse best: 2 -> 1 for mutual cross-check
-    const best_21 = try allocator.alloc(usize, kps2.len);
-    defer allocator.free(best_21);
-    for (kps2, 0..) |kp2, j| {
-        var d1: u32 = std.math.maxInt(u32);
-        var b_idx: usize = 0;
-        for (kps1, 0..) |kp1, i| {
-            const d = hammingDist(kp2.desc, kp1.desc);
-            if (d < d1) {
-                d1 = d;
-                b_idx = i;
-            }
-        }
-        best_21[j] = b_idx;
     }
 
     var matches: std.ArrayList(Match) = .empty;
@@ -393,4 +481,37 @@ test "detectAndCompute and matchDescriptors recover synthetic image translation"
         }
     }
     try std.testing.expect(correct * 2 >= matches.len);
+}
+
+test "detectAndCompute distributes keypoints across high and low contrast regions" {
+    const gpa = std.testing.allocator;
+    const w: u32 = 320;
+    const h: u32 = 240;
+    const img = try gpa.alloc(u8, w * h);
+    defer gpa.free(img);
+
+    // Top-left quadrant has very high contrast; other 3 quadrants have subtle low-contrast texture.
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const xf: f64 = @floatFromInt(x);
+            const yf: f64 = @floatFromInt(y);
+            const amp: f64 = if (x < w / 2 and y < h / 2) 100.0 else 10.0;
+            const val = 127.0 + amp * @sin(xf * 0.35) * @cos(yf * 0.35);
+            img[y * w + x] = @intFromFloat(std.math.clamp(val, 0.0, 255.0));
+        }
+    }
+
+    const kps = try detectAndCompute(gpa, .{ .width = w, .height = h, .gray = img }, 200);
+    defer gpa.free(kps);
+
+    var quad_counts = [4]usize{ 0, 0, 0, 0 };
+    for (kps) |kp| {
+        const qx: usize = if (kp.x >= @as(f64, @floatFromInt(w / 2))) 1 else 0;
+        const qy: usize = if (kp.y >= @as(f64, @floatFromInt(h / 2))) 2 else 0;
+        quad_counts[qy + qx] += 1;
+    }
+
+    for (quad_counts) |cnt| {
+        try std.testing.expect(cnt >= 15);
+    }
 }

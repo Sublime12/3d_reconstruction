@@ -31,16 +31,23 @@ pub const PairwiseVerified = struct {
 };
 
 pub const SfmConfig = struct {
-    max_keypoints: usize = 4500,
+    max_keypoints: usize = 10500,
     match_ratio: f64 = 0.80,
     max_hamming: u32 = 72,
     ransac_iters: usize = 300,
     ransac_thresh_px: f64 = 2.0,
     reproj_thresh_px: f64 = 3.0,
-    min_triang_angle_rad: f64 = 0.03, // ~1.7 deg
+    min_triang_angle_rad: f64 = 0.03,
     seed: u64 = 42,
     /// 1 = single-threaded CPU, 0 = auto-detect CPU core count, >1 = explicit thread count
     num_threads: usize = 1,
+    enable_guided_densification: bool = true,
+    guided_epipolar_thresh_px: f64 = 1.4,
+    guided_match_ratio: f64 = 0.90,
+    guided_max_hamming: u32 = 86,
+    guided_reproj_thresh_px: f64 = 1.0,
+    guided_min_angle_rad: f64 = 0.05,
+    guided_min_zncc: f64 = 0.82,
 };
 
 pub const SfmResult = struct {
@@ -175,15 +182,26 @@ pub fn runIncrementalSfm(
         }
     }
 
-    return runIncrementalSfmFromTracks(
+    return runIncrementalSfmInternal(
         allocator,
         k,
         all_uvs,
         all_cols,
         verified_pairs.items,
         config,
+        if (config.enable_guided_densification) .{
+            .images = images,
+            .all_kps = all_kps,
+            .effective_threads = effective_threads,
+        } else null,
     );
 }
+
+const GuidedDensifyCtx = struct {
+    images: []const dataset.ImageData,
+    all_kps: []const []const features.Keypoint,
+    effective_threads: usize,
+};
 
 pub fn runIncrementalSfmFromTracks(
     allocator: std.mem.Allocator,
@@ -192,6 +210,18 @@ pub fn runIncrementalSfmFromTracks(
     all_cols: ?[]const []const Color,
     verified_pairs: []const PairwiseVerified,
     config: SfmConfig,
+) !SfmResult {
+    return runIncrementalSfmInternal(allocator, k, all_uvs, all_cols, verified_pairs, config, null);
+}
+
+fn runIncrementalSfmInternal(
+    allocator: std.mem.Allocator,
+    k: Mat3,
+    all_uvs: []const []const Vec2,
+    all_cols: ?[]const []const Color,
+    verified_pairs: []const PairwiseVerified,
+    config: SfmConfig,
+    guided_ctx: ?GuidedDensifyCtx,
 ) !SfmResult {
     const n_cams = all_uvs.len;
     if (verified_pairs.len == 0) return error.NoVerifiedPairs;
@@ -311,9 +341,10 @@ pub fn runIncrementalSfmFromTracks(
     poses[init_vp.cam2] = best_pose2;
 
     // Track triangulation state
-    const track_pt_idx = try allocator.alloc(?usize, valid_tracks.items.len);
-    defer allocator.free(track_pt_idx);
-    @memset(track_pt_idx, null);
+    var track_pt_idx: std.ArrayList(?usize) = .empty;
+    defer track_pt_idx.deinit(allocator);
+    try track_pt_idx.resize(allocator, valid_tracks.items.len);
+    @memset(track_pt_idx.items, null);
 
     var points3d: std.ArrayList(Vec3) = .empty;
     errdefer points3d.deinit(allocator);
@@ -326,7 +357,7 @@ pub fn runIncrementalSfmFromTracks(
         poses,
         registered,
         valid_tracks.items,
-        track_pt_idx,
+        track_pt_idx.items,
         &points3d,
         &point_colors,
         all_cols,
@@ -335,7 +366,7 @@ pub fn runIncrementalSfmFromTracks(
 
     if (points3d.items.len < 6) return error.TooFewInitialPoints;
 
-    try runGlobalBA(allocator, k, poses, registered, valid_tracks.items, track_pt_idx, points3d.items);
+    try runGlobalBA(allocator, k, poses, registered, valid_tracks.items, track_pt_idx.items, points3d.items);
 
     // 4. Incremental registration loop
     while (true) {
@@ -346,7 +377,7 @@ pub fn runIncrementalSfmFromTracks(
             if (registered[ci]) continue;
             var count: usize = 0;
             for (valid_tracks.items, 0..) |tr, ti| {
-                if (track_pt_idx[ti] == null) continue;
+                if (track_pt_idx.items[ti] == null) continue;
                 for (tr) |obs| {
                     if (obs.cam_idx == ci) {
                         count += 1;
@@ -369,7 +400,7 @@ pub fn runIncrementalSfmFromTracks(
         defer pnp_2d.deinit(allocator);
 
         for (valid_tracks.items, 0..) |tr, ti| {
-            const pt_idx = track_pt_idx[ti] orelse continue;
+            const pt_idx = track_pt_idx.items[ti] orelse continue;
             for (tr) |obs| {
                 if (obs.cam_idx == next_cam) {
                     try pnp_3d.append(allocator, points3d.items[pt_idx]);
@@ -399,14 +430,36 @@ pub fn runIncrementalSfmFromTracks(
             poses,
             registered,
             valid_tracks.items,
-            track_pt_idx,
+            track_pt_idx.items,
             &points3d,
             &point_colors,
             all_cols,
             config,
         );
 
-        try runGlobalBA(allocator, k, poses, registered, valid_tracks.items, track_pt_idx, points3d.items);
+        try runGlobalBA(allocator, k, poses, registered, valid_tracks.items, track_pt_idx.items, points3d.items);
+    }
+
+    if (guided_ctx) |gctx| {
+        const added = try densifyViaEpipolarGuidedMatching(
+            allocator,
+            k,
+            poses,
+            registered,
+            gctx.images,
+            gctx.all_kps,
+            all_uvs,
+            all_cols,
+            &valid_tracks,
+            &track_pt_idx,
+            &points3d,
+            &point_colors,
+            config,
+            gctx.effective_threads,
+        );
+        if (added > 0) {
+            try runGlobalBAWithIters(allocator, k, poses, registered, valid_tracks.items, track_pt_idx.items, points3d.items, 12);
+        }
     }
 
     // 5. Filter extreme depth/reprojection outliers from final point cloud
@@ -452,7 +505,7 @@ pub fn runIncrementalSfmFromTracks(
     var err_sum: f64 = 0;
     var err_cnt: usize = 0;
     for (valid_tracks.items, 0..) |tr, ti| {
-        const pt_idx = track_pt_idx[ti] orelse continue;
+        const pt_idx = track_pt_idx.items[ti] orelse continue;
         if (!keep_pt[pt_idx]) continue;
         for (tr) |obs| {
             if (!registered[obs.cam_idx]) continue;
@@ -566,6 +619,19 @@ fn runGlobalBA(
     track_pt_idx: []const ?usize,
     points3d: []Vec3,
 ) !void {
+    return runGlobalBAWithIters(allocator, k, poses, registered, tracks, track_pt_idx, points3d, 25);
+}
+
+fn runGlobalBAWithIters(
+    allocator: std.mem.Allocator,
+    k: Mat3,
+    poses: []CameraPose,
+    registered: []const bool,
+    tracks: []const []TrackObs,
+    track_pt_idx: []const ?usize,
+    points3d: []Vec3,
+    max_iters: usize,
+) !void {
     // Map global cam_idx -> compact registered cam_idx
     const cam_to_compact = try allocator.alloc(?usize, poses.len);
     defer allocator.free(cam_to_compact);
@@ -603,10 +669,543 @@ fn runGlobalBA(
         }
     }
 
-    _ = try ba.runBundleAdjustment(allocator, k, compact_poses, points3d, obs_list.items, .{});
+    _ = try ba.runBundleAdjustment(allocator, k, compact_poses, points3d, obs_list.items, .{ .max_iters = max_iters });
 
     for (compact_to_cam.items, 0..) |ci, c_idx| {
         poses[ci] = compact_poses[c_idx];
+    }
+}
+
+fn densifyViaEpipolarGuidedMatching(
+    allocator: std.mem.Allocator,
+    k: Mat3,
+    poses: []const CameraPose,
+    registered: []const bool,
+    images: []const dataset.ImageData,
+    all_kps: []const []const features.Keypoint,
+    all_uvs: []const []const Vec2,
+    all_cols: ?[]const []const Color,
+    valid_tracks: *std.ArrayList([]TrackObs),
+    track_pt_idx: *std.ArrayList(?usize),
+    points3d: *std.ArrayList(Vec3),
+    point_colors: *std.ArrayList(Color),
+    config: SfmConfig,
+    effective_threads: usize,
+) !usize {
+    const n_cams = all_uvs.len;
+    const k_inv = k.inv() orelse return 0;
+
+    // Mark keypoints already belonging to a triangulated 3D point
+    const kp_used = try allocator.alloc([]bool, n_cams);
+    for (kp_used, 0..) |*row, ci| {
+        row.* = try allocator.alloc(bool, all_uvs[ci].len);
+        @memset(row.*, false);
+    }
+    defer {
+        for (kp_used) |row| allocator.free(row);
+        allocator.free(kp_used);
+    }
+
+    for (valid_tracks.items, 0..) |tr, ti| {
+        if (track_pt_idx.items[ti] == null) continue;
+        for (tr) |obs| {
+            kp_used[obs.cam_idx][obs.kp_idx] = true;
+        }
+    }
+
+    // Compute scene centroid and median depth radius for outlier rejection
+    var cam_centroid = Vec3.zero;
+    var reg_count: usize = 0;
+    for (poses, registered) |p, r| {
+        if (r) {
+            cam_centroid = cam_centroid.add(p.cameraCenter());
+            reg_count += 1;
+        }
+    }
+    if (reg_count < 2) return 0;
+    cam_centroid = cam_centroid.scale(1.0 / @as(f64, @floatFromInt(reg_count)));
+
+    var max_dist: f64 = 1e6;
+    if (points3d.items.len > 0) {
+        const dists = try allocator.alloc(f64, points3d.items.len);
+        defer allocator.free(dists);
+        for (points3d.items, 0..) |pt, idx| dists[idx] = pt.dist(cam_centroid);
+        std.mem.sort(f64, dists, {}, std.sort.asc(f64));
+        const med = dists[dists.len / 2];
+        max_dist = @max(med * 5.0, 1e-3);
+    }
+
+    // Select overlapping registered camera pairs with sufficient viewing overlap and baseline
+    var pair_list: std.ArrayList([2]usize) = .empty;
+    defer pair_list.deinit(allocator);
+    const z_axis = Vec3.init(0, 0, 1);
+    for (0..n_cams) |c1| {
+        if (!registered[c1]) continue;
+        const fwd1 = poses[c1].r.transpose().mulVec(z_axis);
+        const cen1 = poses[c1].cameraCenter();
+        for (c1 + 1..n_cams) |c2| {
+            if (!registered[c2]) continue;
+            const fwd2 = poses[c2].r.transpose().mulVec(z_axis);
+            if (fwd1.dot(fwd2) < 0.85) continue;
+            const cen2 = poses[c2].cameraCenter();
+            if (cen1.dist(cen2) < 1e-4) continue;
+            try pair_list.append(allocator, .{ c1, c2 });
+        }
+    }
+    if (pair_list.items.len == 0) return 0;
+
+    const pair_matches = try allocator.alloc([]features.Match, pair_list.items.len);
+    for (pair_matches) |*slot| slot.* = &.{};
+    defer {
+        for (pair_matches) |ms| allocator.free(ms);
+        allocator.free(pair_matches);
+    }
+
+    if (effective_threads <= 1 or pair_list.items.len <= 1) {
+        for (pair_list.items, 0..) |pair, idx| {
+            pair_matches[idx] = try matchPairEpipolarGuided(
+                allocator,
+                k,
+                k_inv,
+                poses[pair[0]],
+                poses[pair[1]],
+                images[pair[0]],
+                images[pair[1]],
+                all_kps[pair[0]],
+                all_kps[pair[1]],
+                all_uvs[pair[0]],
+                all_uvs[pair[1]],
+                kp_used[pair[0]],
+                kp_used[pair[1]],
+                cam_centroid,
+                max_dist,
+                config,
+            );
+        }
+    } else {
+        var next_idx = std.atomic.Value(usize).init(0);
+        var failed = std.atomic.Value(bool).init(false);
+        const worker_count = @min(effective_threads, pair_list.items.len);
+        const threads = try allocator.alloc(std.Thread, worker_count);
+        defer allocator.free(threads);
+
+        for (threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, guidedMatchWorker, .{
+                allocator,
+                k,
+                k_inv,
+                poses,
+                images,
+                all_kps,
+                all_uvs,
+                kp_used,
+                pair_list.items,
+                pair_matches,
+                cam_centroid,
+                max_dist,
+                config,
+                &next_idx,
+                &failed,
+            });
+        }
+        for (threads) |th| th.join();
+        if (failed.load(.acquire)) return error.GuidedDensificationFailed;
+    }
+
+    // Merge guided matches across pairs into multi-view tracks via Union-Find
+    const cam_offsets = try allocator.alloc(usize, n_cams + 1);
+    defer allocator.free(cam_offsets);
+    cam_offsets[0] = 0;
+    for (0..n_cams) |ci| cam_offsets[ci + 1] = cam_offsets[ci] + all_uvs[ci].len;
+    const total_nodes = cam_offsets[n_cams];
+
+    const parent = try allocator.alloc(usize, total_nodes);
+    defer allocator.free(parent);
+    for (0..total_nodes) |i| parent[i] = i;
+
+    const touched = try allocator.alloc(bool, total_nodes);
+    defer allocator.free(touched);
+    @memset(touched, false);
+
+    for (pair_list.items, pair_matches) |pair, matches| {
+        for (matches) |m| {
+            const n1 = cam_offsets[pair[0]] + m.idx1;
+            const n2 = cam_offsets[pair[1]] + m.idx2;
+            touched[n1] = true;
+            touched[n2] = true;
+            ufUnion(parent, n1, n2);
+        }
+    }
+
+    var root_to_track = std.AutoHashMap(usize, usize).init(allocator);
+    defer root_to_track.deinit();
+
+    var guided_tracks: std.ArrayList(std.ArrayList(TrackObs)) = .empty;
+    defer {
+        for (guided_tracks.items) |*tr| tr.deinit(allocator);
+        guided_tracks.deinit(allocator);
+    }
+
+    for (0..n_cams) |ci| {
+        for (all_uvs[ci], 0..) |uv, ki| {
+            const node = cam_offsets[ci] + ki;
+            if (!touched[node]) continue;
+            const root = ufFind(parent, node);
+            const gop = try root_to_track.getOrPut(root);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = guided_tracks.items.len;
+                try guided_tracks.append(allocator, .empty);
+            }
+            try guided_tracks.items[gop.value_ptr.*].append(allocator, .{
+                .cam_idx = ci,
+                .kp_idx = ki,
+                .uv = uv,
+            });
+        }
+    }
+
+    var projs: std.ArrayList([3][4]f64) = .empty;
+    defer projs.deinit(allocator);
+    var obs2d: std.ArrayList(Vec2) = .empty;
+    defer obs2d.deinit(allocator);
+
+    var added_count: usize = 0;
+    for (guided_tracks.items) |tr| {
+        if (tr.items.len < 2) continue;
+
+        var consistent = true;
+        for (0..tr.items.len) |a_i| {
+            for (a_i + 1..tr.items.len) |b_i| {
+                if (tr.items[a_i].cam_idx == tr.items[b_i].cam_idx) {
+                    consistent = false;
+                    break;
+                }
+            }
+            if (!consistent) break;
+        }
+        if (!consistent) continue;
+
+        projs.clearRetainingCapacity();
+        obs2d.clearRetainingCapacity();
+        for (tr.items) |obs| {
+            try projs.append(allocator, triangulation.makeProjectionMatrix(k, poses[obs.cam_idx]));
+            try obs2d.append(allocator, obs.uv);
+        }
+
+        const pt = (try triangulation.triangulateMultiView(allocator, projs.items, obs2d.items)) orelse continue;
+        if (!std.math.isFinite(pt.x) or !std.math.isFinite(pt.y) or !std.math.isFinite(pt.z)) continue;
+        if (pt.dist(cam_centroid) > max_dist) continue;
+
+        const max_reproj = if (tr.items.len == 2) @min(config.guided_reproj_thresh_px, 0.80) else config.guided_reproj_thresh_px;
+        const min_ang = if (tr.items.len == 2) @max(config.guided_min_angle_rad, 0.09) else @max(config.guided_min_angle_rad, 0.06);
+
+        var ok = true;
+        for (tr.items) |obs| {
+            const xc = poses[obs.cam_idx].transformPoint(pt);
+            if (xc.z <= 1e-4) {
+                ok = false;
+                break;
+            }
+            const err = triangulation.reprojectionError(k, poses[obs.cam_idx], pt, obs.uv) orelse {
+                ok = false;
+                break;
+            };
+            if (err > max_reproj) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+
+        var max_angle: f64 = 0;
+        for (0..tr.items.len) |a_i| {
+            const c1 = poses[tr.items[a_i].cam_idx].cameraCenter();
+            for (a_i + 1..tr.items.len) |b_i| {
+                const c2 = poses[tr.items[b_i].cam_idx].cameraCenter();
+                const ang = triangulation.triangulationAngle(c1, c2, pt);
+                if (ang > max_angle) max_angle = ang;
+            }
+        }
+        if (max_angle < min_ang) continue;
+
+        const pt_idx = points3d.items.len;
+        const owned_tr = try allocator.dupe(TrackObs, tr.items);
+        errdefer allocator.free(owned_tr);
+        try valid_tracks.append(allocator, owned_tr);
+        try track_pt_idx.append(allocator, pt_idx);
+        try points3d.append(allocator, pt);
+        if (all_cols) |cols| {
+            const first = tr.items[0];
+            try point_colors.append(allocator, cols[first.cam_idx][first.kp_idx]);
+        } else {
+            try point_colors.append(allocator, .{ .r = 220, .g = 220, .b = 220 });
+        }
+        added_count += 1;
+    }
+
+    return added_count;
+}
+
+fn matchPairEpipolarGuided(
+    allocator: std.mem.Allocator,
+    k: Mat3,
+    k_inv: Mat3,
+    pose1: CameraPose,
+    pose2: CameraPose,
+    img1: dataset.ImageData,
+    img2: dataset.ImageData,
+    kps1: []const features.Keypoint,
+    kps2: []const features.Keypoint,
+    uvs1: []const Vec2,
+    uvs2: []const Vec2,
+    used1: []const bool,
+    used2: []const bool,
+    cam_centroid: Vec3,
+    max_dist: f64,
+    config: SfmConfig,
+) ![]features.Match {
+    var unm1: std.ArrayList(usize) = .empty;
+    defer unm1.deinit(allocator);
+    for (used1, 0..) |u, idx| {
+        if (!u) try unm1.append(allocator, idx);
+    }
+
+    var unm2: std.ArrayList(usize) = .empty;
+    defer unm2.deinit(allocator);
+    for (used2, 0..) |u, idx| {
+        if (!u) try unm2.append(allocator, idx);
+    }
+
+    if (unm1.items.len == 0 or unm2.items.len == 0) {
+        return try allocator.alloc(features.Match, 0);
+    }
+
+    const r_rel = pose2.r.mul(pose1.r.transpose());
+    const t_rel = pose2.t.sub(r_rel.mulVec(pose1.t));
+    const e = Mat3.skew(t_rel).mul(r_rel);
+    const f = epipolar.essentialToFundamental(k_inv, e);
+    const ft = f.transpose();
+
+    const l1_inv_norm = try allocator.alloc(f64, unm2.items.len);
+    defer allocator.free(l1_inv_norm);
+    for (unm2.items, 0..) |kp_idx, j| {
+        const uv = uvs2[kp_idx];
+        const l1 = ft.mulVec(Vec3.init(uv.x, uv.y, 1.0));
+        const n = @sqrt(l1.x * l1.x + l1.y * l1.y);
+        l1_inv_norm[j] = if (n > 1e-12) 1.0 / n else 0.0;
+    }
+
+    const best_12 = try allocator.alloc(?usize, unm1.items.len);
+    defer allocator.free(best_12);
+    const best_d_12 = try allocator.alloc(u32, unm1.items.len);
+    defer allocator.free(best_d_12);
+
+    const best_21 = try allocator.alloc(?usize, unm2.items.len);
+    defer allocator.free(best_21);
+    const d1_21 = try allocator.alloc(u32, unm2.items.len);
+    defer allocator.free(d1_21);
+    const d2_21 = try allocator.alloc(u32, unm2.items.len);
+    defer allocator.free(d2_21);
+    @memset(best_21, null);
+    @memset(d1_21, std.math.maxInt(u32));
+    @memset(d2_21, std.math.maxInt(u32));
+
+    const epi_thresh = config.guided_epipolar_thresh_px;
+
+    for (unm1.items, 0..) |kp_idx1, i| {
+        const uv1 = uvs1[kp_idx1];
+        const l2 = f.mulVec(Vec3.init(uv1.x, uv1.y, 1.0));
+        const l2_norm = @sqrt(l2.x * l2.x + l2.y * l2.y);
+        if (l2_norm <= 1e-12) {
+            best_12[i] = null;
+            continue;
+        }
+        const inv_l2 = 1.0 / l2_norm;
+        const desc1 = kps1[kp_idx1].desc;
+
+        var d1: u32 = std.math.maxInt(u32);
+        var d2: u32 = std.math.maxInt(u32);
+        var b_j: ?usize = null;
+
+        for (unm2.items, 0..) |kp_idx2, j| {
+            const inv_l1 = l1_inv_norm[j];
+            if (inv_l1 == 0.0) continue;
+            const uv2 = uvs2[kp_idx2];
+            const num = @abs(l2.x * uv2.x + l2.y * uv2.y + l2.z);
+            if (num * inv_l2 > epi_thresh or num * inv_l1 > epi_thresh) continue;
+
+            const d = features.hammingDist(desc1, kps2[kp_idx2].desc);
+            if (d < d1) {
+                d2 = d1;
+                d1 = d;
+                b_j = j;
+            } else if (d < d2) {
+                d2 = d;
+            }
+            if (d < d1_21[j]) {
+                d2_21[j] = d1_21[j];
+                d1_21[j] = d;
+                best_21[j] = i;
+            } else if (d < d2_21[j]) {
+                d2_21[j] = d;
+            }
+        }
+
+        if (b_j != null and d1 <= config.guided_max_hamming and
+            @as(f64, @floatFromInt(d1)) < config.guided_match_ratio * @as(f64, @floatFromInt(d2)))
+        {
+            best_12[i] = b_j;
+            best_d_12[i] = d1;
+        } else {
+            best_12[i] = null;
+        }
+    }
+
+    const p1 = triangulation.makeProjectionMatrix(k, pose1);
+    const p2 = triangulation.makeProjectionMatrix(k, pose2);
+    const c1 = pose1.cameraCenter();
+    const c2 = pose2.cameraCenter();
+
+    var matches: std.ArrayList(features.Match) = .empty;
+    defer matches.deinit(allocator);
+
+    for (best_12, 0..) |opt_j, i| {
+        const j = opt_j orelse continue;
+        if (best_21[j] != i) continue;
+        if (@as(f64, @floatFromInt(d1_21[j])) >= config.guided_match_ratio * @as(f64, @floatFromInt(d2_21[j]))) continue;
+
+        const kp_idx1 = unm1.items[i];
+        const kp_idx2 = unm2.items[j];
+        const uv1 = uvs1[kp_idx1];
+        const uv2 = uvs2[kp_idx2];
+
+        const zncc = computePatchZncc(img1, uv1, img2, uv2, 3) orelse continue;
+        if (zncc < config.guided_min_zncc) continue;
+
+        const pt = (try triangulation.triangulatePoint(allocator, p1, p2, uv1, uv2)) orelse continue;
+        if (!std.math.isFinite(pt.x) or !std.math.isFinite(pt.y) or !std.math.isFinite(pt.z)) continue;
+        if (pt.dist(cam_centroid) > max_dist) continue;
+
+        if (pose1.transformPoint(pt).z <= 1e-4 or pose2.transformPoint(pt).z <= 1e-4) continue;
+        const err1 = triangulation.reprojectionError(k, pose1, pt, uv1) orelse continue;
+        const err2 = triangulation.reprojectionError(k, pose2, pt, uv2) orelse continue;
+        if (err1 > config.guided_reproj_thresh_px or err2 > config.guided_reproj_thresh_px) continue;
+        if (triangulation.triangulationAngle(c1, c2, pt) < config.guided_min_angle_rad) continue;
+
+        try matches.append(allocator, .{
+            .idx1 = kp_idx1,
+            .idx2 = kp_idx2,
+            .dist = best_d_12[i],
+        });
+    }
+
+    return try matches.toOwnedSlice(allocator);
+}
+
+fn computePatchZncc(
+    img1: dataset.ImageData,
+    uv1: Vec2,
+    img2: dataset.ImageData,
+    uv2: Vec2,
+    radius: isize,
+) ?f64 {
+    const cx1: isize = @intFromFloat(@round(uv1.x));
+    const cy1: isize = @intFromFloat(@round(uv1.y));
+    const cx2: isize = @intFromFloat(@round(uv2.x));
+    const cy2: isize = @intFromFloat(@round(uv2.y));
+
+    if (cx1 < radius or cy1 < radius or cx1 + radius >= @as(isize, @intCast(img1.width)) or cy1 + radius >= @as(isize, @intCast(img1.height))) return null;
+    if (cx2 < radius or cy2 < radius or cx2 + radius >= @as(isize, @intCast(img2.width)) or cy2 + radius >= @as(isize, @intCast(img2.height))) return null;
+
+    const w1: usize = img1.width;
+    const w2: usize = img2.width;
+    var sum1: f64 = 0;
+    var sum2: f64 = 0;
+    var count: f64 = 0;
+
+    var dy: isize = -radius;
+    while (dy <= radius) : (dy += 1) {
+        const y1: usize = @intCast(cy1 + dy);
+        const y2: usize = @intCast(cy2 + dy);
+        var dx: isize = -radius;
+        while (dx <= radius) : (dx += 1) {
+            const x1: usize = @intCast(cx1 + dx);
+            const x2: usize = @intCast(cx2 + dx);
+            sum1 += @floatFromInt(img1.gray[y1 * w1 + x1]);
+            sum2 += @floatFromInt(img2.gray[y2 * w2 + x2]);
+            count += 1.0;
+        }
+    }
+
+    const m1 = sum1 / count;
+    const m2 = sum2 / count;
+    var cov: f64 = 0;
+    var v1: f64 = 0;
+    var v2: f64 = 0;
+
+    dy = -radius;
+    while (dy <= radius) : (dy += 1) {
+        const y1: usize = @intCast(cy1 + dy);
+        const y2: usize = @intCast(cy2 + dy);
+        var dx: isize = -radius;
+        while (dx <= radius) : (dx += 1) {
+            const x1: usize = @intCast(cx1 + dx);
+            const x2: usize = @intCast(cx2 + dx);
+            const a = @as(f64, @floatFromInt(img1.gray[y1 * w1 + x1])) - m1;
+            const b = @as(f64, @floatFromInt(img2.gray[y2 * w2 + x2])) - m2;
+            cov += a * b;
+            v1 += a * a;
+            v2 += b * b;
+        }
+    }
+
+    if (v1 < 4.0 or v2 < 4.0) return null;
+    return cov / @sqrt(v1 * v2);
+}
+
+fn guidedMatchWorker(
+    allocator: std.mem.Allocator,
+    k: Mat3,
+    k_inv: Mat3,
+    poses: []const CameraPose,
+    images: []const dataset.ImageData,
+    all_kps: []const []const features.Keypoint,
+    all_uvs: []const []const Vec2,
+    kp_used: []const []const bool,
+    pair_list: []const [2]usize,
+    pair_matches: [][]features.Match,
+    cam_centroid: Vec3,
+    max_dist: f64,
+    config: SfmConfig,
+    next_idx: *std.atomic.Value(usize),
+    failed: *std.atomic.Value(bool),
+) void {
+    while (true) {
+        if (failed.load(.acquire)) return;
+        const idx = next_idx.fetchAdd(1, .monotonic);
+        if (idx >= pair_list.len) return;
+        const pair = pair_list[idx];
+        pair_matches[idx] = matchPairEpipolarGuided(
+            allocator,
+            k,
+            k_inv,
+            poses[pair[0]],
+            poses[pair[1]],
+            images[pair[0]],
+            images[pair[1]],
+            all_kps[pair[0]],
+            all_kps[pair[1]],
+            all_uvs[pair[0]],
+            all_uvs[pair[1]],
+            kp_used[pair[0]],
+            kp_used[pair[1]],
+            cam_centroid,
+            max_dist,
+            config,
+        ) catch {
+            failed.store(true, .release);
+            return;
+        };
     }
 }
 
@@ -846,4 +1445,106 @@ test "End-to-end incremental SfM recovers 5-camera trajectory and 3D structure" 
     try std.testing.expectEqual(@as(usize, n_cams), res.registered_count);
     try std.testing.expect(res.points.len >= 35);
     try std.testing.expect(res.mean_reproj_err < 1.0);
+}
+
+test "Guided epipolar densification recovers additional 3D points along epipolar lines" {
+    const gpa = std.testing.allocator;
+    const w: u32 = 320;
+    const h: u32 = 240;
+    const k = Mat3.fromRows(
+        .{ 400, 0, 160 },
+        .{ 0, 400, 120 },
+        .{ 0, 0, 1 },
+    );
+
+    const poses = [_]CameraPose{
+        CameraPose.identity,
+        .{ .r = lie.so3Exp(Vec3.init(0.0, 0.15, 0.0)), .t = Vec3.init(-0.8, 0.0, 0.1) },
+        .{ .r = lie.so3Exp(Vec3.init(0.0, 0.30, 0.0)), .t = Vec3.init(-1.6, 0.0, 0.25) },
+    };
+    const registered = [_]bool{ true, true, true };
+
+    var images: [3]dataset.ImageData = undefined;
+    for (0..3) |ci| {
+        const gray = try gpa.alloc(u8, w * h);
+        const rgb = try gpa.alloc(u8, w * h * 3);
+        @memset(gray, 128);
+        @memset(rgb, 128);
+        images[ci] = .{ .width = w, .height = h, .rgb = rgb, .gray = gray };
+    }
+    defer for (&images) |*img| img.deinit(gpa);
+
+    // Paint distinctive textured 7x7 patches around projected 3D points in all 3 images.
+    const pts_gt = [_]Vec3{
+        Vec3.init(-0.4, -0.2, 5.0),
+        Vec3.init(0.3, 0.2, 5.5),
+        Vec3.init(0.0, -0.3, 6.0),
+    };
+
+    var kps_storage: [3][3]features.Keypoint = undefined;
+    var uvs_storage: [3][3]Vec2 = undefined;
+    var kps_slices: [3][]const features.Keypoint = undefined;
+    var uvs_slices: [3][]const Vec2 = undefined;
+
+    for (pts_gt, 0..) |pt, pi| {
+        for (0..3) |ci| {
+            const uv = lie.projectPoint(k, poses[ci], pt).?;
+            uvs_storage[ci][pi] = uv;
+            kps_storage[ci][pi] = .{
+                .x = uv.x,
+                .y = uv.y,
+                .score = 1000.0,
+                .angle = 0.0,
+                .desc = .{ @as(u64, pi) + 1, 0, 0, 0 },
+            };
+            const cx: isize = @intFromFloat(@round(uv.x));
+            const cy: isize = @intFromFloat(@round(uv.y));
+            var dy: isize = -3;
+            while (dy <= 3) : (dy += 1) {
+                var dx: isize = -3;
+                while (dx <= 3) : (dx += 1) {
+                    const px: usize = @intCast(cx + dx);
+                    const py: usize = @intCast(cy + dy);
+                    const val: u8 = @intCast(80 + @as(isize, @intCast(pi)) * 20 + dx * 7 + dy * 11);
+                    images[ci].gray[py * w + px] = val;
+                }
+            }
+        }
+    }
+    for (0..3) |ci| {
+        kps_slices[ci] = &kps_storage[ci];
+        uvs_slices[ci] = &uvs_storage[ci];
+    }
+
+    var valid_tracks: std.ArrayList([]TrackObs) = .empty;
+    defer {
+        for (valid_tracks.items) |tr| gpa.free(tr);
+        valid_tracks.deinit(gpa);
+    }
+    var track_pt_idx: std.ArrayList(?usize) = .empty;
+    defer track_pt_idx.deinit(gpa);
+    var points3d: std.ArrayList(Vec3) = .empty;
+    defer points3d.deinit(gpa);
+    var point_colors: std.ArrayList(Color) = .empty;
+    defer point_colors.deinit(gpa);
+
+    const added = try densifyViaEpipolarGuidedMatching(
+        gpa,
+        k,
+        &poses,
+        &registered,
+        &images,
+        &kps_slices,
+        &uvs_slices,
+        null,
+        &valid_tracks,
+        &track_pt_idx,
+        &points3d,
+        &point_colors,
+        .{},
+        1,
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), added);
+    try std.testing.expectEqual(@as(usize, 3), points3d.items.len);
 }

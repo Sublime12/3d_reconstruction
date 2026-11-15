@@ -369,6 +369,34 @@ fn drawTexturedQuad(
     c.glDrawArrays(c.GL_TRIANGLES, 0, 6);
 }
 
+fn computePhotoFit(win_w: f64, win_h: f64, img_w: f64, img_h: f64, is_cam_view: bool) vm.FittedPhotoRect {
+    const pad_top: f64 = if (is_cam_view) 96.0 else 64.0;
+    const pad_bot: f64 = 36.0;
+    const pad_side: f64 = 16.0;
+    return vm.fitImageToMargins(win_w, win_h, img_w, img_h, pad_side, pad_top, pad_side, pad_bot);
+}
+
+const PipRect = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+};
+
+fn computePipRect(win_wf: f32, win_hf: f32, img_w: f64, img_h: f64) PipRect {
+    const max_pip_w: f32 = @min(240.0, win_wf * 0.22);
+    const max_pip_h: f32 = @max(48.0, win_hf * 0.24);
+    const aspect: f32 = @floatCast(@max(1.0, img_h) / @max(1.0, img_w));
+    const pip_w: f32 = @min(max_pip_w, max_pip_h / @max(0.1, aspect));
+    const pip_h: f32 = pip_w * aspect;
+    return .{
+        .x = win_wf - pip_w - 22.0,
+        .y = win_hf - pip_h - 42.0,
+        .w = pip_w,
+        .h = pip_h,
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
@@ -681,12 +709,13 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        const proj = vm.buildProjectionFromK(k, img_w, img_h, win_w, win_h, 0.08, 250.0);
+        const pick_fit = computePhotoFit(win_w, win_h, img_w, img_h, active_cam != null);
+        const pick_proj = vm.buildProjectionFromKWithFit(k, pick_fit, win_w, win_h, 0.08, 250.0);
         const view = vm.poseToViewMatrix(current_pose);
 
         hover_cam = null;
         if (!over_ui and cam_count > 0) {
-            if (vm.screenPointToRay(mx, my, win_w, win_h, proj, view)) |ray| {
+            if (vm.screenPointToRay(mx, my, win_w, win_h, pick_proj, view)) |ray| {
                 hover_cam = vm.pickCamera(ray, cam_poses, cam_reg, hit_radius);
             }
         }
@@ -856,6 +885,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // Render frame
+        const fit = computePhotoFit(win_w, win_h, img_w, img_h, active_cam != null);
+        const proj = vm.buildProjectionFromKWithFit(k, fit, win_w, win_h, 0.08, 250.0);
+
         c.glViewport(0, 0, fb_w_i, fb_h_i);
         c.glClearColor(0.07, 0.08, 0.10, 1.0);
         c.glClear(c.GL_COLOR_BUFFER_BIT | c.GL_DEPTH_BUFFER_BIT);
@@ -931,8 +963,6 @@ pub fn main(init: std.process.Init) !void {
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
 
-        const fit = vm.fitImageToWindow(win_w, win_h, img_w, img_h);
-
         // Optional real photo overlay directly aligned with the active camera projection
         if (active_cam) |ac| {
             if (has_photo[ac] and overlay_mode > 0) {
@@ -945,6 +975,19 @@ pub fn main(init: std.process.Init) !void {
 
         // Draw HUD panels & buttons
         ui_batch.clear();
+        if (active_cam != null) {
+            try ui_batch.addRectBorder(
+                gpa,
+                fit.x - 1.5,
+                fit.y - 1.5,
+                fit.w + 3.0,
+                fit.h + 3.0,
+                1.5,
+                win_wf,
+                win_hf,
+                .{ 0.25, 0.78, 1.0, 0.85 },
+            );
+        }
         try ui_batch.addRect(gpa, 0, 0, win_wf, if (active_cam != null) 88 else 56, win_wf, win_hf, .{ 0.05, 0.06, 0.08, 0.78 });
 
         for (ui_buttons.items) |btn| {
@@ -984,16 +1027,15 @@ pub fn main(init: std.process.Init) !void {
         try ui_batch.addText(gpa, 14, win_hf - 19, 1.5, status, win_wf, win_hf, .{ 0.85, 0.89, 0.95, 1.0 });
 
         // PiP card border & label if active camera + show_pip
-        if (active_cam) |ac| {
-            if (has_photo[ac] and show_pip) {
-                const pip_w: f32 = @min(300.0, win_wf * 0.26);
-                const pip_h: f32 = pip_w * @as(f32, @floatCast(img_h / img_w));
-                const pip_x: f32 = win_wf - pip_w - 18.0;
-                const pip_y: f32 = win_hf - pip_h - 44.0;
-                try ui_batch.addRect(gpa, pip_x - 6, pip_y - 24, pip_w + 12, pip_h + 30, win_wf, win_hf, .{ 0.06, 0.07, 0.09, 0.90 });
-                try ui_batch.addRectBorder(gpa, pip_x - 6, pip_y - 24, pip_w + 12, pip_h + 30, 1.5, win_wf, win_hf, .{ 0.25, 0.72, 1.0, 0.90 });
-                try ui_batch.addText(gpa, pip_x, pip_y - 17, 1.5, "REAL PHOTO REFERENCE", win_wf, win_hf, .{ 0.55, 0.88, 1.0, 1.0 });
-            }
+        const pip_rect: ?PipRect = if (active_cam) |ac|
+            if (has_photo[ac] and show_pip) computePipRect(win_wf, win_hf, img_w, img_h) else null
+        else
+            null;
+
+        if (pip_rect) |pip| {
+            try ui_batch.addRect(gpa, pip.x - 6, pip.y - 24, pip.w + 12, pip.h + 30, win_wf, win_hf, .{ 0.06, 0.07, 0.09, 0.90 });
+            try ui_batch.addRectBorder(gpa, pip.x - 6, pip.y - 24, pip.w + 12, pip.h + 30, 1.5, win_wf, win_hf, .{ 0.25, 0.72, 1.0, 0.90 });
+            try ui_batch.addText(gpa, pip.x, pip.y - 17, 1.5, "REAL PHOTO REFERENCE", win_wf, win_hf, .{ 0.55, 0.88, 1.0, 1.0 });
         }
 
         c.glUseProgram(prog_2d_col);
@@ -1010,16 +1052,11 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // Draw real photo PiP thumbnail inside card
-        if (active_cam) |ac| {
-            if (has_photo[ac] and show_pip) {
-                const pip_w: f32 = @min(300.0, win_wf * 0.26);
-                const pip_h: f32 = pip_w * @as(f32, @floatCast(img_h / img_w));
-                const pip_x: f32 = win_wf - pip_w - 18.0;
-                const pip_y: f32 = win_hf - pip_h - 44.0;
-                c.glUseProgram(prog_2d_tex);
-                c.glBindVertexArray(tex_vao);
-                drawTexturedQuad(tex_vbo, pip_x, pip_y, pip_w, pip_h, win_wf, win_hf, cam_textures[ac], 1.0, u_tex_loc, u_alpha_loc);
-            }
+        if (pip_rect) |pip| {
+            const ac = active_cam.?;
+            c.glUseProgram(prog_2d_tex);
+            c.glBindVertexArray(tex_vao);
+            drawTexturedQuad(tex_vbo, pip.x, pip.y, pip.w, pip.h, win_wf, win_hf, cam_textures[ac], 1.0, u_tex_loc, u_alpha_loc);
         }
 
         c.glDisable(c.GL_BLEND);

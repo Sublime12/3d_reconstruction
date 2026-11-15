@@ -97,8 +97,21 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.log.info("Building colored surface mesh from {d} sparse points...", .{result.points.len});
-    var colored_mesh = try sfm.mesh.buildColoredMesh(gpa, result.points, result.colors, reg_poses.items, .{});
+    var colored_mesh = try sfm.mesh.buildColoredMesh(gpa, result.points, result.colors, reg_poses.items, .{ .fill_holes = false });
     defer colored_mesh.deinit(gpa);
+
+    try sfm.mesh.completeMeshWithPhotoVerify(
+        gpa,
+        &colored_mesh,
+        k,
+        images,
+        result.poses,
+        result.registered,
+        reg_poses.items,
+        .{},
+    );
+
+    try sfm.mesh.fillMeshInteriorHoles(gpa, &colored_mesh, reg_poses.items, .{});
 
     std.log.info("Subdividing mesh and projecting photos onto {d} triangles...", .{colored_mesh.faces.len});
     try sfm.mesh.subdivideAndProjectTexture(
@@ -214,8 +227,19 @@ fn runVerifyViews(
         defer gpa.free(reg_holdout);
         reg_holdout[holdout_idx] = false;
 
-        var holdout_mesh = try sfm.mesh.buildColoredMesh(gpa, result.points, result.colors, reg_poses, .{});
+        var holdout_mesh = try sfm.mesh.buildColoredMesh(gpa, result.points, result.colors, reg_poses, .{ .fill_holes = false });
         defer holdout_mesh.deinit(gpa);
+        try sfm.mesh.completeMeshWithPhotoVerify(
+            gpa,
+            &holdout_mesh,
+            k,
+            images,
+            result.poses,
+            reg_holdout,
+            reg_poses,
+            .{},
+        );
+        try sfm.mesh.fillMeshInteriorHoles(gpa, &holdout_mesh, reg_poses, .{});
         try sfm.mesh.subdivideAndProjectTexture(gpa, &holdout_mesh, k, images, result.poses, reg_holdout, 2);
 
         const target_img = images[holdout_idx];

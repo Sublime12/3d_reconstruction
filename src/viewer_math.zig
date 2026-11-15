@@ -98,35 +98,48 @@ pub const FittedPhotoRect = struct {
     scale: f64,
 };
 
-pub fn fitImageToWindow(win_w: f64, win_h: f64, img_w: f64, img_h: f64) FittedPhotoRect {
-    const scale = @min(win_w / @max(1.0, img_w), win_h / @max(1.0, img_h));
+pub fn fitImageToMargins(
+    win_w: f64,
+    win_h: f64,
+    img_w: f64,
+    img_h: f64,
+    pad_left: f64,
+    pad_top: f64,
+    pad_right: f64,
+    pad_bot: f64,
+) FittedPhotoRect {
+    const avail_w = @max(1.0, win_w - pad_left - pad_right);
+    const avail_h = @max(1.0, win_h - pad_top - pad_bot);
+    const scale = @min(avail_w / @max(1.0, img_w), avail_h / @max(1.0, img_h));
     const drawn_w = img_w * scale;
     const drawn_h = img_h * scale;
     return .{
-        .x = @floatCast((win_w - drawn_w) * 0.5),
-        .y = @floatCast((win_h - drawn_h) * 0.5),
+        .x = @floatCast(pad_left + (avail_w - drawn_w) * 0.5),
+        .y = @floatCast(pad_top + (avail_h - drawn_h) * 0.5),
         .w = @floatCast(drawn_w),
         .h = @floatCast(drawn_h),
         .scale = scale,
     };
 }
 
+pub fn fitImageToWindow(win_w: f64, win_h: f64, img_w: f64, img_h: f64) FittedPhotoRect {
+    return fitImageToMargins(win_w, win_h, img_w, img_h, 0.0, 0.0, 0.0, 0.0);
+}
+
 /// Build OpenGL clip-space projection matching SfM camera convention (+X right, +Y down, +Z forward)
-/// scaled to fit `(img_w, img_h)` inside window `(win_w, win_h)` while filling the full viewport.
-pub fn buildProjectionFromK(
+/// mapped into `fit` inside window `(win_w, win_h)` while filling the full viewport.
+pub fn buildProjectionFromKWithFit(
     k: Mat3,
-    img_w: f64,
-    img_h: f64,
+    fit: FittedPhotoRect,
     win_w: f64,
     win_h: f64,
     near_z: f64,
     far_z: f64,
 ) Mat4 {
-    const fit = fitImageToWindow(win_w, win_h, img_w, img_h);
     const fx_w = k.m[0][0] * fit.scale;
     const fy_w = k.m[1][1] * fit.scale;
-    const cx_w = (k.m[0][2] - img_w * 0.5) * fit.scale + win_w * 0.5;
-    const cy_w = (k.m[1][2] - img_h * 0.5) * fit.scale + win_h * 0.5;
+    const cx_w = @as(f64, fit.x) + k.m[0][2] * fit.scale;
+    const cy_w = @as(f64, fit.y) + k.m[1][2] * fit.scale;
 
     const a: f32 = @floatCast(2.0 * fx_w / win_w);
     const b: f32 = @floatCast(-2.0 * fy_w / win_h);
@@ -141,6 +154,21 @@ pub fn buildProjectionFromK(
         c_x, c_y, p_z, 1,
         0,   0,   q_z, 0,
     } };
+}
+
+/// Build OpenGL clip-space projection matching SfM camera convention (+X right, +Y down, +Z forward)
+/// scaled to fit `(img_w, img_h)` inside window `(win_w, win_h)` while filling the full viewport.
+pub fn buildProjectionFromK(
+    k: Mat3,
+    img_w: f64,
+    img_h: f64,
+    win_w: f64,
+    win_h: f64,
+    near_z: f64,
+    far_z: f64,
+) Mat4 {
+    const fit = fitImageToWindow(win_w, win_h, img_w, img_h);
+    return buildProjectionFromKWithFit(k, fit, win_w, win_h, near_z, far_z);
 }
 
 pub fn poseToViewMatrix(pose: CameraPose) Mat4 {
@@ -437,4 +465,66 @@ test "OrbitFrame keeps camera looking at target" {
     try std.testing.expectApproxEqAbs(0.0, xc.x, 1e-5);
     try std.testing.expectApproxEqAbs(0.0, xc.y, 1e-5);
     try std.testing.expectApproxEqAbs(orbit.dist, xc.z, 1e-5);
+}
+
+test "fitImageToMargins and buildProjectionFromKWithFit frame exact image bounds" {
+    const win_w = 1280.0;
+    const win_h = 800.0;
+    const pad_left = 16.0;
+    const pad_top = 96.0;
+    const pad_right = 16.0;
+    const pad_bot = 36.0;
+
+    const cases = [_][2]f64{
+        .{ 1600.0, 1200.0 },
+        .{ 1920.0, 1080.0 },
+        .{ 900.0, 1200.0 },
+    };
+
+    const r = lie.so3Exp(Vec3.init(-0.15, 0.25, -0.08));
+    const pose = CameraPose{ .r = r, .t = Vec3.init(-0.4, 0.2, 3.5) };
+    const view = poseToViewMatrix(pose);
+    const rt = pose.r.transpose();
+    const cam_center = pose.cameraCenter();
+
+    for (cases) |dims| {
+        const img_w = dims[0];
+        const img_h = dims[1];
+        const fit = fitImageToMargins(win_w, win_h, img_w, img_h, pad_left, pad_top, pad_right, pad_bot);
+
+        try std.testing.expect(fit.x >= pad_left);
+        try std.testing.expect(fit.y >= pad_top);
+        try std.testing.expect(@as(f64, fit.x) + @as(f64, fit.w) <= win_w - pad_right + 1e-4);
+        try std.testing.expect(@as(f64, fit.y) + @as(f64, fit.h) <= win_h - pad_bot + 1e-4);
+
+        const fx = img_w * 0.9;
+        const fy = img_w * 0.9;
+        const cx = img_w * 0.52;
+        const cy = img_h * 0.48;
+        const k = Mat3{ .m = .{
+            .{ fx, 0.0, cx },
+            .{ 0.0, fy, cy },
+            .{ 0.0, 0.0, 1.0 },
+        } };
+        const proj = buildProjectionFromKWithFit(k, fit, win_w, win_h, 0.1, 100.0);
+        const vp = proj.mul(view);
+
+        const z = 5.0;
+        const p_tl_cam = Vec3.init((0.0 - cx) / fx * z, (0.0 - cy) / fy * z, z);
+        const p_br_cam = Vec3.init((img_w - cx) / fx * z, (img_h - cy) / fy * z, z);
+        const p_tl = cam_center.add(rt.mulVec(p_tl_cam));
+        const p_br = cam_center.add(rt.mulVec(p_br_cam));
+
+        const clip_tl = vp.mulVec4(.{ p_tl.x, p_tl.y, p_tl.z, 1.0 });
+        const sx_tl = (clip_tl[0] / clip_tl[3] + 1.0) * 0.5 * win_w;
+        const sy_tl = (1.0 - clip_tl[1] / clip_tl[3]) * 0.5 * win_h;
+        try std.testing.expectApproxEqAbs(@as(f64, fit.x), sx_tl, 1e-3);
+        try std.testing.expectApproxEqAbs(@as(f64, fit.y), sy_tl, 1e-3);
+
+        const clip_br = vp.mulVec4(.{ p_br.x, p_br.y, p_br.z, 1.0 });
+        const sx_br = (clip_br[0] / clip_br[3] + 1.0) * 0.5 * win_w;
+        const sy_br = (1.0 - clip_br[1] / clip_br[3]) * 0.5 * win_h;
+        try std.testing.expectApproxEqAbs(@as(f64, fit.x) + @as(f64, fit.w), sx_br, 1e-3);
+        try std.testing.expectApproxEqAbs(@as(f64, fit.y) + @as(f64, fit.h), sy_br, 1e-3);
+    }
 }
