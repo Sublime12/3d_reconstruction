@@ -12,7 +12,6 @@ pub const bundle_adjust = @import("bundle_adjust.zig");
 pub const io_ply = @import("io_ply.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const mesh = @import("mesh.zig");
-pub const dense = @import("dense.zig");
 pub const render = @import("render.zig");
 pub const viewer_math = @import("viewer_math.zig");
 pub const gpu = @import("gpu.zig");
