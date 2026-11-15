@@ -409,16 +409,51 @@ pub fn runIncrementalSfmFromTracks(
         try runGlobalBA(allocator, k, poses, registered, valid_tracks.items, track_pt_idx, points3d.items);
     }
 
-    // 5. Final RMSE and registered count
+    // 5. Filter extreme depth/reprojection outliers from final point cloud
+    var cam_centroid = Vec3.zero;
     var reg_count: usize = 0;
-    for (registered) |r| {
-        if (r) reg_count += 1;
+    for (poses, registered) |p, r| {
+        if (r) {
+            cam_centroid = cam_centroid.add(p.cameraCenter());
+            reg_count += 1;
+        }
+    }
+    if (reg_count > 0) {
+        cam_centroid = cam_centroid.scale(1.0 / @as(f64, @floatFromInt(reg_count)));
+    }
+
+    const pt_dists = try allocator.alloc(f64, points3d.items.len);
+    defer allocator.free(pt_dists);
+    for (points3d.items, 0..) |pt, idx| {
+        pt_dists[idx] = pt.dist(cam_centroid);
+    }
+    const sorted_dists = try allocator.dupe(f64, pt_dists);
+    defer allocator.free(sorted_dists);
+    std.mem.sort(f64, sorted_dists, {}, std.sort.asc(f64));
+    const median_dist = if (sorted_dists.len > 0) sorted_dists[sorted_dists.len / 2] else 1.0;
+    const max_dist = @max(median_dist * 5.0, 1e-3);
+
+    var clean_pts: std.ArrayList(Vec3) = .empty;
+    errdefer clean_pts.deinit(allocator);
+    var clean_cols: std.ArrayList(Color) = .empty;
+    errdefer clean_cols.deinit(allocator);
+    const keep_pt = try allocator.alloc(bool, points3d.items.len);
+    defer allocator.free(keep_pt);
+    for (points3d.items, point_colors.items, pt_dists, 0..) |pt, col, d, idx| {
+        if (std.math.isFinite(pt.x) and std.math.isFinite(pt.y) and std.math.isFinite(pt.z) and d <= max_dist) {
+            keep_pt[idx] = true;
+            try clean_pts.append(allocator, pt);
+            try clean_cols.append(allocator, col);
+        } else {
+            keep_pt[idx] = false;
+        }
     }
 
     var err_sum: f64 = 0;
     var err_cnt: usize = 0;
     for (valid_tracks.items, 0..) |tr, ti| {
         const pt_idx = track_pt_idx[ti] orelse continue;
+        if (!keep_pt[pt_idx]) continue;
         for (tr) |obs| {
             if (!registered[obs.cam_idx]) continue;
             if (triangulation.reprojectionError(k, poses[obs.cam_idx], points3d.items[pt_idx], obs.uv)) |e| {
@@ -431,11 +466,14 @@ pub fn runIncrementalSfmFromTracks(
     }
     const mean_err = if (err_cnt > 0) err_sum / @as(f64, @floatFromInt(err_cnt)) else 0;
 
+    points3d.deinit(allocator);
+    point_colors.deinit(allocator);
+
     return .{
         .poses = poses,
         .registered = registered,
-        .points = try points3d.toOwnedSlice(allocator),
-        .colors = try point_colors.toOwnedSlice(allocator),
+        .points = try clean_pts.toOwnedSlice(allocator),
+        .colors = try clean_cols.toOwnedSlice(allocator),
         .mean_reproj_err = mean_err,
         .registered_count = reg_count,
     };

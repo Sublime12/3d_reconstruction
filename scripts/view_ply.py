@@ -53,7 +53,7 @@ def main():
             z=zs,
             mode="markers",
             name="3D Points",
-            marker=dict(size=2.5, color=colors),
+            marker=dict(size=3.0, color=colors),
         )
     )
     if cxs:
