@@ -109,6 +109,17 @@ pub fn main(init: std.process.Init) !void {
     var colored_mesh = try sfm.mesh.buildColoredMesh(gpa, result.points, result.colors, reg_poses.items, .{});
     defer colored_mesh.deinit(gpa);
 
+    std.log.info("Subdividing mesh and projecting photos onto {d} triangles...", .{colored_mesh.faces.len});
+    try sfm.mesh.subdivideAndProjectTexture(
+        gpa,
+        &colored_mesh,
+        k,
+        images,
+        result.poses,
+        result.registered,
+        2,
+    );
+
     const ply_bytes = try sfm.io_ply.formatPlyMesh(
         gpa,
         colored_mesh.points,

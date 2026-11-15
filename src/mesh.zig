@@ -1,7 +1,10 @@
 const std = @import("std");
 const Vec2 = @import("math/vec.zig").Vec2;
 const Vec3 = @import("math/vec.zig").Vec3;
-const CameraPose = @import("math/lie.zig").CameraPose;
+const Mat3 = @import("math/mat.zig").Mat3;
+const lie = @import("math/lie.zig");
+const CameraPose = lie.CameraPose;
+const dataset = @import("dataset.zig");
 const Color = @import("io_ply.zig").Color;
 
 pub const Triangle = [3]usize;
@@ -395,6 +398,157 @@ fn triHasEdge(v: [3]usize, a: usize, b: usize) bool {
     return false;
 }
 
+/// Subdivide mesh triangles and project RGB pixel colors from the best-facing photo onto every vertex.
+pub fn subdivideAndProjectTexture(
+    allocator: std.mem.Allocator,
+    mesh: *Mesh,
+    k: Mat3,
+    images: []const dataset.ImageData,
+    poses: []const CameraPose,
+    registered: []const bool,
+    subdiv_levels: u32,
+) !void {
+    if (mesh.faces.len == 0) return;
+
+    var verts: std.ArrayList(Vec3) = .empty;
+    errdefer verts.deinit(allocator);
+    try verts.appendSlice(allocator, mesh.points);
+
+    var faces: std.ArrayList(Triangle) = .empty;
+    errdefer faces.deinit(allocator);
+    try faces.appendSlice(allocator, mesh.faces);
+
+    for (0..subdiv_levels) |_| {
+        var edge_midpoints = std.AutoHashMap(u64, usize).init(allocator);
+        defer edge_midpoints.deinit();
+
+        var next_faces: std.ArrayList(Triangle) = .empty;
+        errdefer next_faces.deinit(allocator);
+        try next_faces.ensureTotalCapacity(allocator, faces.items.len * 4);
+
+        for (faces.items) |tri| {
+            const m01 = try getOrCreateMidpoint(allocator, &verts, &edge_midpoints, tri[0], tri[1]);
+            const m12 = try getOrCreateMidpoint(allocator, &verts, &edge_midpoints, tri[1], tri[2]);
+            const m20 = try getOrCreateMidpoint(allocator, &verts, &edge_midpoints, tri[2], tri[0]);
+
+            try next_faces.append(allocator, .{ tri[0], m01, m20 });
+            try next_faces.append(allocator, .{ m01, tri[1], m12 });
+            try next_faces.append(allocator, .{ m20, m12, tri[2] });
+            try next_faces.append(allocator, .{ m01, m12, m20 });
+        }
+
+        faces.deinit(allocator);
+        faces = next_faces;
+    }
+
+    // Compute smooth per-vertex normals for choosing the best-facing camera
+    const normals = try allocator.alloc(Vec3, verts.items.len);
+    defer allocator.free(normals);
+    @memset(normals, Vec3.zero);
+    for (faces.items) |tri| {
+        const a = verts.items[tri[0]];
+        const b = verts.items[tri[1]];
+        const c = verts.items[tri[2]];
+        const fn_vec = b.sub(a).cross(c.sub(a));
+        normals[tri[0]] = normals[tri[0]].add(fn_vec);
+        normals[tri[1]] = normals[tri[1]].add(fn_vec);
+        normals[tri[2]] = normals[tri[2]].add(fn_vec);
+    }
+    for (normals) |*nrm| {
+        nrm.* = nrm.normalize();
+    }
+
+    // Precompute camera centers
+    const cam_centers = try allocator.alloc(Vec3, poses.len);
+    defer allocator.free(cam_centers);
+    for (poses, 0..) |p, ci| cam_centers[ci] = p.cameraCenter();
+
+    // Project every vertex onto the best-facing registered photo to sample RGB color
+    const new_cols = try allocator.alloc(Color, verts.items.len);
+    errdefer allocator.free(new_cols);
+
+    for (verts.items, normals, 0..) |pt, nrm, vi| {
+        var best_score: f64 = -1.0;
+        var best_col: ?Color = null;
+
+        for (images, poses, registered, cam_centers) |img, pose, is_reg, cam_c| {
+            if (!is_reg) continue;
+            const uv = lie.projectPoint(k, pose, pt) orelse continue;
+            const wf: f64 = @floatFromInt(img.width);
+            const hf: f64 = @floatFromInt(img.height);
+            if (uv.x < 1.0 or uv.x >= wf - 2.0 or uv.y < 1.0 or uv.y >= hf - 2.0) continue;
+
+            const ray_to_cam = cam_c.sub(pt).normalize();
+            const cos_view = if (nrm.normSq() > 0.5) @max(0.05, nrm.dot(ray_to_cam)) else 1.0;
+            const dx = (uv.x - wf * 0.5) / wf;
+            const dy = (uv.y - hf * 0.5) / hf;
+            const centrality = @max(0.1, 1.0 - @sqrt(dx * dx + dy * dy));
+            const score = cos_view * centrality;
+
+            if (score > best_score) {
+                best_score = score;
+                best_col = sampleBilinearRgb(img, uv.x, uv.y);
+            }
+        }
+
+        if (best_col) |col| {
+            new_cols[vi] = col;
+        } else if (vi < mesh.colors.len) {
+            new_cols[vi] = mesh.colors[vi];
+        } else {
+            new_cols[vi] = .{ .r = 160, .g = 160, .b = 160 };
+        }
+    }
+
+    allocator.free(mesh.points);
+    allocator.free(mesh.colors);
+    allocator.free(mesh.faces);
+    mesh.points = try verts.toOwnedSlice(allocator);
+    mesh.colors = new_cols;
+    mesh.faces = try faces.toOwnedSlice(allocator);
+}
+
+fn getOrCreateMidpoint(
+    allocator: std.mem.Allocator,
+    verts: *std.ArrayList(Vec3),
+    edge_map: *std.AutoHashMap(u64, usize),
+    a: usize,
+    b: usize,
+) !usize {
+    const lo = @min(a, b);
+    const hi = @max(a, b);
+    const key = (@as(u64, lo) << 32) | @as(u64, hi);
+    const gop = try edge_map.getOrPut(key);
+    if (gop.found_existing) return gop.value_ptr.*;
+
+    const mid = verts.items[lo].add(verts.items[hi]).scale(0.5);
+    const idx = verts.items.len;
+    try verts.append(allocator, mid);
+    gop.value_ptr.* = idx;
+    return idx;
+}
+
+fn sampleBilinearRgb(img: dataset.ImageData, ux: f64, vy: f64) Color {
+    const w: usize = img.width;
+    const x0: usize = @intFromFloat(@floor(ux));
+    const y0: usize = @intFromFloat(@floor(vy));
+    const x1 = @min(w - 1, x0 + 1);
+    const y1 = @min(@as(usize, img.height) - 1, y0 + 1);
+    const wx = ux - @as(f64, @floatFromInt(x0));
+    const wy = vy - @as(f64, @floatFromInt(y0));
+
+    var out: [3]u8 = undefined;
+    for (0..3) |ch| {
+        const p00: f64 = @floatFromInt(img.rgb[(y0 * w + x0) * 3 + ch]);
+        const p10: f64 = @floatFromInt(img.rgb[(y0 * w + x1) * 3 + ch]);
+        const p01: f64 = @floatFromInt(img.rgb[(y1 * w + x0) * 3 + ch]);
+        const p11: f64 = @floatFromInt(img.rgb[(y1 * w + x1) * 3 + ch]);
+        const v = (1.0 - wy) * ((1.0 - wx) * p00 + wx * p10) + wy * ((1.0 - wx) * p01 + wx * p11);
+        out[ch] = @intFromFloat(std.math.clamp(@round(v), 0.0, 255.0));
+    }
+    return .{ .r = out[0], .g = out[1], .b = out[2] };
+}
+
 test "buildColoredMesh filters outliers and triangulates coherent 3D grid" {
     const gpa = std.testing.allocator;
     var pts: std.ArrayList(Vec3) = .empty;
@@ -423,4 +577,58 @@ test "buildColoredMesh filters outliers and triangulates coherent 3D grid" {
     // Outlier removed; 36 grid vertices form 2*(5*5) = 50 triangles
     try std.testing.expectEqual(@as(usize, 36), mesh.points.len);
     try std.testing.expectEqual(@as(usize, 50), mesh.faces.len);
+}
+
+test "subdivideAndProjectTexture subdivides mesh and projects photo RGB onto vertices" {
+    const gpa = std.testing.allocator;
+    const w: u32 = 64;
+    const h: u32 = 64;
+    const k = Mat3.fromRows(
+        .{ 64, 0, 32 },
+        .{ 0, 64, 32 },
+        .{ 0, 0, 1 },
+    );
+
+    const rgb = try gpa.alloc(u8, w * h * 3);
+    defer gpa.free(rgb);
+    const gray = try gpa.alloc(u8, w * h);
+    defer gpa.free(gray);
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const idx = y * w + x;
+            rgb[idx * 3 + 0] = @intCast(x * 3);
+            rgb[idx * 3 + 1] = @intCast(y * 3);
+            rgb[idx * 3 + 2] = 200;
+            gray[idx] = 128;
+        }
+    }
+
+    const images = [_]dataset.ImageData{
+        .{ .width = w, .height = h, .rgb = rgb, .gray = gray },
+    };
+    const poses = [_]CameraPose{CameraPose.identity};
+    const reg = [_]bool{true};
+
+    const pts = try gpa.dupe(Vec3, &.{
+        Vec3.init(-1.0, -1.0, 4.0),
+        Vec3.init(1.0, -1.0, 4.0),
+        Vec3.init(0.0, 1.0, 4.0),
+    });
+    const cols = try gpa.dupe(Color, &.{
+        .{ .r = 0, .g = 0, .b = 0 },
+        .{ .r = 0, .g = 0, .b = 0 },
+        .{ .r = 0, .g = 0, .b = 0 },
+    });
+    const faces = try gpa.dupe(Triangle, &.{.{ 0, 1, 2 }});
+
+    var mesh = Mesh{ .points = pts, .colors = cols, .faces = faces };
+    defer mesh.deinit(gpa);
+
+    try subdivideAndProjectTexture(gpa, &mesh, k, &images, &poses, &reg, 1);
+    try std.testing.expectEqual(@as(usize, 6), mesh.points.len);
+    try std.testing.expectEqual(@as(usize, 4), mesh.faces.len);
+    // Center midpoint of bottom edge (0, -1, 4) projects to (u=32, v=16) -> R=96, G=48, B=200
+    try std.testing.expectEqual(@as(u8, 96), mesh.colors[3].r);
+    try std.testing.expectEqual(@as(u8, 48), mesh.colors[3].g);
+    try std.testing.expectEqual(@as(u8, 200), mesh.colors[3].b);
 }

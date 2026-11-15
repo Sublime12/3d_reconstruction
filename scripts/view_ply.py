@@ -74,7 +74,7 @@ def main():
                 vertexcolor=colors,
                 name="Colored Mesh",
                 flatshading=False,
-                lighting=dict(ambient=0.85, diffuse=0.5, specular=0.1),
+                lighting=dict(ambient=0.95, diffuse=0.25, specular=0.05),
             )
         )
         title = f"SfM Colored Mesh ({len(xs)} vertices, {len(fi)} triangles, {len(cxs)} cameras)"
