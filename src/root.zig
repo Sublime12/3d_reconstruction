@@ -16,6 +16,9 @@ pub const render = @import("render.zig");
 pub const viewer_math = @import("viewer_math.zig");
 pub const gpu = @import("gpu.zig");
 pub const neural_depth = @import("neural_depth.zig");
+pub const nerf = @import("nerf.zig");
+pub const nerf_gpu = @import("nerf_gpu.zig");
+pub const marching_cubes = @import("marching_cubes.zig");
 
 pub const CliOptions = struct {
     data_dir: []const u8 = "data/fountain-p11",
@@ -25,6 +28,8 @@ pub const CliOptions = struct {
     use_gpu: bool = false,
     nn_model_path: ?[]const u8 = null,
     verify_views_dir: ?[]const u8 = null,
+    use_nerf: bool = false,
+    nerf_steps: usize = 1500,
     show_help: bool = false,
 };
 
@@ -52,6 +57,11 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         } else if (std.mem.eql(u8, args[i], "--verify-views") and i + 1 < args.len) {
             i += 1;
             opts.verify_views_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--nerf")) {
+            opts.use_nerf = true;
+        } else if (std.mem.eql(u8, args[i], "--nerf-steps") and i + 1 < args.len) {
+            i += 1;
+            opts.nerf_steps = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             opts.show_help = true;
         }
@@ -75,6 +85,9 @@ test "parseCliArgs parses flags" {
         "models/moge-2-vitb-normal.onnx",
         "--verify-views",
         "output/views",
+        "--nerf",
+        "--nerf-steps",
+        "900",
     };
     const opts = try parseCliArgs(&argv);
     try std.testing.expectEqualStrings("data/test", opts.data_dir);
@@ -84,6 +97,8 @@ test "parseCliArgs parses flags" {
     try std.testing.expect(opts.use_gpu);
     try std.testing.expectEqualStrings("models/moge-2-vitb-normal.onnx", opts.nn_model_path.?);
     try std.testing.expectEqualStrings("output/views", opts.verify_views_dir.?);
+    try std.testing.expect(opts.use_nerf);
+    try std.testing.expectEqual(@as(usize, 900), opts.nerf_steps);
     try std.testing.expect(!opts.show_help);
 }
 

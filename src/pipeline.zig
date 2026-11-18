@@ -31,6 +31,15 @@ pub const PairwiseVerified = struct {
     }
 };
 
+pub const SfmTimings = struct {
+    gpu_init_ms: f64 = 0,
+    feature_extract_ms: f64 = 0,
+    match_verify_ms: f64 = 0,
+    incremental_ba_ms: f64 = 0,
+    guided_densify_ms: f64 = 0,
+    final_ba_ms: f64 = 0,
+};
+
 pub const SfmConfig = struct {
     max_keypoints: usize = 10500,
     match_ratio: f64 = 0.80,
@@ -51,6 +60,8 @@ pub const SfmConfig = struct {
     guided_reproj_thresh_px: f64 = 1.0,
     guided_min_angle_rad: f64 = 0.05,
     guided_min_zncc: f64 = 0.82,
+    io: ?std.Io = null,
+    timings: ?*SfmTimings = null,
 };
 
 pub const SfmResult = struct {
@@ -70,6 +81,17 @@ pub const SfmResult = struct {
     }
 };
 
+fn clockStamp(io_opt: ?std.Io) ?std.Io.Timestamp {
+    const io_val = io_opt orelse return null;
+    return std.Io.Clock.now(.awake, io_val);
+}
+
+fn clockElapsedMs(io_opt: ?std.Io, t0_opt: ?std.Io.Timestamp) f64 {
+    const io_val = io_opt orelse return 0;
+    const t0 = t0_opt orelse return 0;
+    return @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.now(.awake, io_val)).nanoseconds)) / 1e6;
+}
+
 pub fn runIncrementalSfm(
     allocator: std.mem.Allocator,
     k: Mat3,
@@ -78,13 +100,17 @@ pub fn runIncrementalSfm(
 ) !SfmResult {
     const n_cams = images.len;
     if (n_cams < 2) return error.NotEnoughImages;
+    if (config.timings) |tm| tm.* = .{};
 
     const effective_threads = resolveThreadCount(config.num_threads);
 
+    const t_gpu0 = clockStamp(config.io);
     var gpu_ctx_opt: ?gpu.GpuContext = if (config.use_gpu) try gpu.GpuContext.init() else null;
     defer if (gpu_ctx_opt) |*g| g.deinit();
+    if (config.timings) |tm| tm.gpu_init_ms = clockElapsedMs(config.io, t_gpu0);
 
     // 1. Feature detection (CPU single/multi-threaded or WebGPU Harris + CPU NMS/BRIEF)
+    const t_feat0 = clockStamp(config.io);
     const all_kps = try allocator.alloc([]features.Keypoint, n_cams);
     for (all_kps) |*slot| slot.* = &.{};
     defer {
@@ -195,6 +221,8 @@ pub fn runIncrementalSfm(
     }
 
     // 2. Pairwise matching + geometric verification (WebGPU batched or CPU single/multi-threaded)
+    if (config.timings) |tm| tm.feature_extract_ms = clockElapsedMs(config.io, t_feat0);
+    const t_match0 = clockStamp(config.io);
     const n_pairs = (n_cams * (n_cams - 1)) / 2;
     const pair_indices = try allocator.alloc([2]usize, n_pairs);
     defer allocator.free(pair_indices);
@@ -269,6 +297,7 @@ pub fn runIncrementalSfm(
             try verified_pairs.append(allocator, vp);
         }
     }
+    if (config.timings) |tm| tm.match_verify_ms = clockElapsedMs(config.io, t_match0);
 
     return runIncrementalSfmInternal(
         allocator,
@@ -313,6 +342,7 @@ fn runIncrementalSfmInternal(
 ) !SfmResult {
     const n_cams = all_uvs.len;
     if (verified_pairs.len == 0) return error.NoVerifiedPairs;
+    const t_inc0 = clockStamp(config.io);
 
     // Build Union-Find over all (cam_idx, kp_idx) nodes
     const cam_offsets = try allocator.alloc(usize, n_cams + 1);
@@ -527,8 +557,10 @@ fn runIncrementalSfmInternal(
 
         try runGlobalBA(allocator, k, poses, registered, valid_tracks.items, track_pt_idx.items, points3d.items);
     }
+    if (config.timings) |tm| tm.incremental_ba_ms = clockElapsedMs(config.io, t_inc0);
 
     if (guided_ctx) |gctx| {
+        const t_gd0 = clockStamp(config.io);
         const added = try densifyViaEpipolarGuidedMatching(
             allocator,
             k,
@@ -545,8 +577,11 @@ fn runIncrementalSfmInternal(
             config,
             gctx.effective_threads,
         );
+        if (config.timings) |tm| tm.guided_densify_ms = clockElapsedMs(config.io, t_gd0);
         if (added > 0) {
+            const t_fba0 = clockStamp(config.io);
             try runGlobalBAWithIters(allocator, k, poses, registered, valid_tracks.items, track_pt_idx.items, points3d.items, 12);
+            if (config.timings) |tm| tm.final_ba_ms = clockElapsedMs(config.io, t_fba0);
         }
     }
 

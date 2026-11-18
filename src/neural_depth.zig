@@ -10,6 +10,13 @@ const Color = @import("io_ply.zig").Color;
 const mesh_mod = @import("mesh.zig");
 const render = @import("render.zig");
 
+pub const NeuralHoleTimings = struct {
+    init_ms: f64 = 0,
+    prerender_ms: f64 = 0,
+    infer_ms: f64 = 0,
+    stitch_ms: f64 = 0,
+};
+
 pub const NeuralHoleConfig = struct {
     model_path: []const u8,
     num_threads: usize = 0,
@@ -21,6 +28,8 @@ pub const NeuralHoleConfig = struct {
     grid_target_nodes_short: u32 = 170,
     max_added_points: usize = 120000,
     max_depth_grad_rel: f32 = 0.14,
+    io: ?std.Io = null,
+    timings: ?*NeuralHoleTimings = null,
 };
 
 pub const Prediction = struct {
@@ -46,6 +55,8 @@ pub const NeuralSession = struct {
     allocator_ptr: *c.OrtAllocator,
     in_names_z: [][*:0]u8,
     out_names_z: [][*:0]u8,
+    input_0_ndim: usize,
+    is_imagenet_norm: bool,
     num_tokens_ndim: usize,
     zig_alloc: std.mem.Allocator,
 
@@ -136,6 +147,19 @@ pub const NeuralSession = struct {
             out_loaded += 1;
         }
 
+        var input_0_ndim: usize = 4;
+        if (in_count >= 1) {
+            var ti0: ?*c.OrtTypeInfo = null;
+            try checkStatus(api, api.SessionGetInputTypeInfo.?(session, 0, &ti0));
+            defer if (ti0) |t| api.ReleaseTypeInfo.?(t);
+            var t_info0: ?*const c.OrtTensorTypeAndShapeInfo = null;
+            try checkStatus(api, api.CastTypeInfoToTensorInfo.?(ti0, &t_info0));
+            if (t_info0) |tensor_info0| {
+                try checkStatus(api, api.GetDimensionsCount.?(tensor_info0, &input_0_ndim));
+            }
+        }
+        const is_imagenet_norm = in_count >= 1 and std.mem.eql(u8, std.mem.span(in_names_z[0]), "pixel_values");
+
         var num_tokens_ndim: usize = 0;
         if (in_count >= 2) {
             var ti: ?*c.OrtTypeInfo = null;
@@ -157,6 +181,8 @@ pub const NeuralSession = struct {
             .allocator_ptr = ort_alloc,
             .in_names_z = in_names_z,
             .out_names_z = out_names_z,
+            .input_0_ndim = input_0_ndim,
+            .is_imagenet_norm = is_imagenet_norm,
             .num_tokens_ndim = num_tokens_ndim,
             .zig_alloc = zig_alloc,
         };
@@ -192,16 +218,23 @@ pub const NeuralSession = struct {
         const nchw = try allocator.alloc(f32, 3 * plane);
         defer allocator.free(nchw);
 
-        fillResizedNchw01(rgb, src_w, src_h, target_w, target_h, nchw);
+        if (self.is_imagenet_norm) {
+            fillResizedNchwImageNet(rgb, src_w, src_h, target_w, target_h, nchw);
+        } else {
+            fillResizedNchw01(rgb, src_w, src_h, target_w, target_h, nchw);
+        }
 
-        const img_shape = [4]i64{ 1, 3, @intCast(th), @intCast(tw) };
+        const img_shape_4 = [4]i64{ 1, 3, @intCast(th), @intCast(tw) };
+        const img_shape_5 = [5]i64{ 1, 1, 3, @intCast(th), @intCast(tw) };
+        const shape_ptr: [*]const i64 = if (self.input_0_ndim == 5) &img_shape_5 else &img_shape_4;
+        const shape_len: usize = if (self.input_0_ndim == 5) img_shape_5.len else img_shape_4.len;
         var img_val: ?*c.OrtValue = null;
         try checkStatus(self.api, self.api.CreateTensorWithDataAsOrtValue.?(
             self.mem_info,
             nchw.ptr,
             nchw.len * @sizeOf(f32),
-            &img_shape,
-            img_shape.len,
+            shape_ptr,
+            shape_len,
             c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             &img_val,
         ));
@@ -290,45 +323,67 @@ pub const NeuralSession = struct {
             try checkStatus(self.api, self.api.GetTensorMutableData.?(val, &raw_ptr_opt));
             const raw_ptr = raw_ptr_opt orelse continue;
 
-            if (std.mem.eql(u8, nm, "points") or (oi == 0 and depth_out == null)) {
+            const is_depth_out = std.mem.eql(u8, nm, "points") or
+                std.mem.eql(u8, nm, "predicted_depth") or
+                std.mem.eql(u8, nm, "depth") or
+                (oi == 0 and depth_out == null);
+            if (is_depth_out) {
                 if (elem_type != c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return error.OnnxUnexpectedOutputType;
                 const data: [*]const f32 = @ptrCast(@alignCast(raw_ptr));
-                // Handle both [1, H, W, 3] (MoGe standard) and [1, 3, H, W]
                 var h_out: usize = th;
                 var w_out: usize = tw;
-                var is_nhwc = true;
+                var chan_mode: enum { scalar, nhwc_z, nchw_z } = .scalar;
                 if (safe_ndim == 4 and dims_buf[3] == 3) {
                     h_out = @intCast(dims_buf[1]);
                     w_out = @intCast(dims_buf[2]);
-                    is_nhwc = true;
+                    chan_mode = .nhwc_z;
                 } else if (safe_ndim == 4 and dims_buf[1] == 3) {
                     h_out = @intCast(dims_buf[2]);
                     w_out = @intCast(dims_buf[3]);
-                    is_nhwc = false;
+                    chan_mode = .nchw_z;
+                } else if (safe_ndim == 4 and dims_buf[1] == 1) {
+                    h_out = @intCast(dims_buf[2]);
+                    w_out = @intCast(dims_buf[3]);
+                } else if (safe_ndim == 4 and dims_buf[3] == 1) {
+                    h_out = @intCast(dims_buf[1]);
+                    w_out = @intCast(dims_buf[2]);
                 } else if (safe_ndim == 3) {
                     h_out = @intCast(dims_buf[1]);
                     w_out = @intCast(dims_buf[2]);
-                    is_nhwc = false;
+                } else if (safe_ndim == 2) {
+                    h_out = @intCast(dims_buf[0]);
+                    w_out = @intCast(dims_buf[1]);
                 }
                 out_w = @intCast(w_out);
                 out_h = @intCast(h_out);
                 const np = h_out * w_out;
                 const d_slice = try allocator.alloc(f32, np);
-                if (safe_ndim == 3) {
-                    @memcpy(d_slice, data[0..np]);
-                } else if (is_nhwc) {
-                    for (0..np) |p| d_slice[p] = data[p * 3 + 2];
-                } else {
-                    @memcpy(d_slice, data[2 * np .. 3 * np]);
+                switch (chan_mode) {
+                    .scalar => @memcpy(d_slice, data[0..np]),
+                    .nhwc_z => {
+                        for (0..np) |p| d_slice[p] = data[p * 3 + 2];
+                    },
+                    .nchw_z => @memcpy(d_slice, data[2 * np .. 3 * np]),
                 }
                 depth_out = d_slice;
-            } else if (std.mem.eql(u8, nm, "mask")) {
+            } else if (std.mem.eql(u8, nm, "mask") or (std.mem.eql(u8, nm, "confidence") and mask_out == null)) {
                 const np = @as(usize, out_w) * @as(usize, out_h);
                 if (elem_count >= np) {
                     const m_slice = try allocator.alloc(f32, np);
                     if (elem_type == c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
                         const data: [*]const f32 = @ptrCast(@alignCast(raw_ptr));
-                        @memcpy(m_slice, data[0..np]);
+                        if (std.mem.eql(u8, nm, "confidence")) {
+                            for (0..np) |p| {
+                                if (!std.math.isFinite(data[p]) or data[p] <= 0.0) {
+                                    m_slice[p] = 0.0;
+                                } else {
+                                    const c_excess = @max(@as(f32, 0.0), data[p] - 1.0);
+                                    m_slice[p] = 0.60 + 0.40 * (c_excess / (c_excess + 0.25));
+                                }
+                            }
+                        } else {
+                            @memcpy(m_slice, data[0..np]);
+                        }
                     } else if (elem_type == c.ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL or elem_type == c.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8) {
                         const bdata: [*]const u8 = @ptrCast(raw_ptr);
                         for (0..np) |p| m_slice[p] = if (bdata[p] != 0) 1.0 else 0.0;
@@ -361,12 +416,14 @@ pub const NeuralSession = struct {
     }
 };
 
-pub fn fillResizedNchw01(
+fn fillResizedNchwNormalized(
     rgb: []const u8,
     src_w: u32,
     src_h: u32,
     dst_w: u32,
     dst_h: u32,
+    scale_255: [3]f64,
+    bias: [3]f64,
     nchw_out: []f32,
 ) void {
     const plane = @as(usize, dst_w) * @as(usize, dst_h);
@@ -400,18 +457,55 @@ pub fn fillResizedNchw01(
                     w10 * @as(f64, @floatFromInt(rgb[idx10 + ch])) +
                     w01 * @as(f64, @floatFromInt(rgb[idx01 + ch])) +
                     w11 * @as(f64, @floatFromInt(rgb[idx11 + ch]));
-                nchw_out[ch * plane + p_idx] = @floatCast(v / 255.0);
+                nchw_out[ch * plane + p_idx] = @floatCast(v * scale_255[ch] + bias[ch]);
             }
         }
     }
+}
+
+pub fn fillResizedNchw01(
+    rgb: []const u8,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    nchw_out: []f32,
+) void {
+    const s = 1.0 / 255.0;
+    fillResizedNchwNormalized(rgb, src_w, src_h, dst_w, dst_h, .{ s, s, s }, .{ 0, 0, 0 }, nchw_out);
+}
+
+pub fn fillResizedNchwImageNet(
+    rgb: []const u8,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    nchw_out: []f32,
+) void {
+    const mean = [3]f64{ 0.485, 0.456, 0.406 };
+    const std_v = [3]f64{ 0.229, 0.224, 0.225 };
+    const scale_255 = [3]f64{ 1.0 / (255.0 * std_v[0]), 1.0 / (255.0 * std_v[1]), 1.0 / (255.0 * std_v[2]) };
+    const bias = [3]f64{ -mean[0] / std_v[0], -mean[1] / std_v[1], -mean[2] / std_v[2] };
+    fillResizedNchwNormalized(rgb, src_w, src_h, dst_w, dst_h, scale_255, bias, nchw_out);
 }
 
 pub const AffineFit = struct {
     scale: f64,
     shift: f64,
     quad: f64 = 0.0,
+    is_disparity: bool = false,
+    inv_floor: f64 = 1e-3,
     inlier_count: usize,
     mad_residual: f64,
+
+    pub fn evalDepth(self: AffineFit, p_raw: f32) f64 {
+        const p: f64 = p_raw;
+        if (self.is_disparity) {
+            return 1.0 / @max(self.inv_floor, self.scale * p + self.shift);
+        }
+        return (self.quad * p + self.scale) * p + self.shift;
+    }
 };
 
 pub fn fitAffineDepthIrlS(pred: []const f32, target: []const f32, weights: []const bool) ?AffineFit {
@@ -662,6 +756,141 @@ pub fn fitMonotoneQuadDepthWeightedIrlS(
         .inlier_count = base.inlier_count,
         .mad_residual = if (n_err > 0) err_sum / @as(f64, @floatFromInt(n_err)) else 0.0,
     };
+}
+
+/// Fits inverse-depth (disparity) predictions `1/Z ≈ a * pred + b` via Huber IRLS
+/// minimizing relative depth error across near and far SfM anchors.
+pub fn fitDisparityDepthWeightedIrlS(
+    pred: []const f32,
+    target: []const f32,
+    valid: []const bool,
+    base_weights: ?[]const f64,
+) ?AffineFit {
+    var sw: f64 = 0;
+    var sp: f64 = 0;
+    var si: f64 = 0;
+    var spp: f64 = 0;
+    var spi: f64 = 0;
+    var valid_count: usize = 0;
+    var max_t: f64 = 0;
+
+    for (pred, target, valid, 0..) |pv, tv, ok, idx| {
+        if (!ok or !std.math.isFinite(pv) or !std.math.isFinite(tv) or tv <= 1e-4) continue;
+        const bw: f64 = if (base_weights) |bws| bws[idx] else 1.0;
+        if (!(bw > 0.0 and std.math.isFinite(bw))) continue;
+        const p: f64 = pv;
+        const t: f64 = tv;
+        const inv_t = 1.0 / t;
+        const w = bw * t * t;
+        sw += w;
+        sp += w * p;
+        si += w * inv_t;
+        spp += w * p * p;
+        spi += w * p * inv_t;
+        max_t = @max(max_t, t);
+        valid_count += 1;
+    }
+    if (valid_count < 32 or sw <= 1e-12) return null;
+    const det0 = spp * sw - sp * sp;
+    if (@abs(det0) < 1e-12) return null;
+    var a = (spi * sw - sp * si) / det0;
+    var b = (spp * si - sp * spi) / det0;
+    if (!(a > 0.0 and std.math.isFinite(a) and std.math.isFinite(b))) return null;
+
+    const inv_floor = @min(@as(f64, 1e-3), 0.1 / @max(1.0, max_t));
+    var delta: f64 = 0.06;
+    for (0..6) |_| {
+        var r_sw: f64 = 0;
+        var r_sp: f64 = 0;
+        var r_si: f64 = 0;
+        var r_spp: f64 = 0;
+        var r_spi: f64 = 0;
+        var err_wsum: f64 = 0;
+        var bw_sum: f64 = 0;
+        var cnt: usize = 0;
+
+        for (pred, target, valid, 0..) |pv, tv, ok, idx| {
+            if (!ok or !std.math.isFinite(pv) or !std.math.isFinite(tv) or tv <= 1e-4) continue;
+            const bw: f64 = if (base_weights) |bws| bws[idx] else 1.0;
+            if (!(bw > 0.0 and std.math.isFinite(bw))) continue;
+            const p: f64 = pv;
+            const t: f64 = tv;
+            const z_est = 1.0 / @max(inv_floor, a * p + b);
+            const rel_err = @abs(z_est - t) / t;
+            err_wsum += bw * rel_err;
+            bw_sum += bw;
+            cnt += 1;
+
+            const huber_w = if (rel_err <= delta) 1.0 else delta / rel_err;
+            const w = bw * huber_w * t * t;
+            const inv_t = 1.0 / t;
+            r_sw += w;
+            r_sp += w * p;
+            r_si += w * inv_t;
+            r_spp += w * p * p;
+            r_spi += w * p * inv_t;
+        }
+        if (cnt < 32 or bw_sum <= 1e-12) break;
+        delta = @max(0.015, 1.5 * (err_wsum / bw_sum));
+        const det = r_spp * r_sw - r_sp * r_sp;
+        if (@abs(det) < 1e-12) break;
+        const na = (r_spi * r_sw - r_sp * r_si) / det;
+        const nb = (r_spp * r_si - r_sp * r_spi) / det;
+        if (na > 0.0 and std.math.isFinite(na) and std.math.isFinite(nb)) {
+            a = na;
+            b = nb;
+        }
+    }
+
+    var err_sum: f64 = 0;
+    var n_err: usize = 0;
+    for (pred, target, valid) |pv, tv, ok| {
+        if (!ok or !std.math.isFinite(pv) or !std.math.isFinite(tv) or tv <= 1e-4) continue;
+        const z_est = 1.0 / @max(inv_floor, a * @as(f64, pv) + b);
+        err_sum += @abs(z_est - @as(f64, tv));
+        n_err += 1;
+    }
+    return .{
+        .scale = a,
+        .shift = b,
+        .is_disparity = true,
+        .inv_floor = inv_floor,
+        .inlier_count = valid_count,
+        .mad_residual = if (n_err > 0) err_sum / @as(f64, @floatFromInt(n_err)) else 0.0,
+    };
+}
+
+/// Automatically aligns either direct depth (`+Z`) or disparity (`1/Z`) predictions to metric SfM depth.
+pub fn fitDepthAlignment(
+    pred: []const f32,
+    target: []const f32,
+    valid: []const bool,
+    base_weights: ?[]const f64,
+) ?AffineFit {
+    var sw: f64 = 0;
+    var sp: f64 = 0;
+    var st: f64 = 0;
+    var spt: f64 = 0;
+    var cnt: usize = 0;
+    for (pred, target, valid, 0..) |pv, tv, ok, idx| {
+        if (!ok or !std.math.isFinite(pv) or !std.math.isFinite(tv) or tv <= 1e-4) continue;
+        const bw: f64 = if (base_weights) |bws| bws[idx] else 1.0;
+        if (!(bw > 0.0 and std.math.isFinite(bw))) continue;
+        const p: f64 = pv;
+        const t: f64 = tv;
+        sw += bw;
+        sp += bw * p;
+        st += bw * t;
+        spt += bw * p * t;
+        cnt += 1;
+    }
+    if (cnt < 32 or sw <= 1e-12) return null;
+    const cov = spt * sw - sp * st;
+    if (cov < 0.0) {
+        if (fitDisparityDepthWeightedIrlS(pred, target, valid, base_weights)) |disp_fit| return disp_fit;
+    }
+    return fitMonotoneQuadDepthWeightedIrlS(pred, target, valid, base_weights) orelse
+        fitDisparityDepthWeightedIrlS(pred, target, valid, base_weights);
 }
 
 fn roundUpDiv14(v: u32) u32 {
@@ -1195,8 +1424,24 @@ pub fn completeMeshHolesWithTransformer(
 ) !usize {
     if (mesh.points.len < 16 or mesh.faces.len == 0 or images.len == 0) return 0;
 
+    const nowMs = struct {
+        fn stamp(io_opt: ?std.Io) ?std.Io.Timestamp {
+            const io_val = io_opt orelse return null;
+            return std.Io.Clock.now(.awake, io_val);
+        }
+        fn elapsed(io_opt: ?std.Io, t0_opt: ?std.Io.Timestamp) f64 {
+            const io_val = io_opt orelse return 0;
+            const t0 = t0_opt orelse return 0;
+            return @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.now(.awake, io_val)).nanoseconds)) / 1e6;
+        }
+    };
+
+    if (config.timings) |tm| tm.* = .{};
+
+    const t_init0 = nowMs.stamp(config.io);
     var sess = try NeuralSession.init(allocator, config.model_path, config.num_threads);
     defer sess.deinit();
+    if (config.timings) |tm| tm.init_ms += nowMs.elapsed(config.io, t_init0);
 
     var reg_cams: std.ArrayList(usize) = .empty;
     defer reg_cams.deinit(allocator);
@@ -1206,6 +1451,7 @@ pub fn completeMeshHolesWithTransformer(
     if (reg_cams.items.len == 0) return 0;
 
     // Rasterize initial SfM mesh into all registered cameras for scale fitting & empty-space checks
+    const t_pre0 = nowMs.stamp(config.io);
     const renders_base = try allocator.alloc(render.RenderedView, reg_cams.items.len);
     for (reg_cams.items, 0..) |ci, ri| {
         renders_base[ri] = try render.renderMeshView(
@@ -1219,6 +1465,7 @@ pub fn completeMeshHolesWithTransformer(
             mesh.faces,
         );
     }
+    if (config.timings) |tm| tm.prerender_ms += nowMs.elapsed(config.io, t_pre0);
     defer {
         for (renders_base) |*rv| rv.deinit(allocator);
         allocator.free(renders_base);
@@ -1295,10 +1542,12 @@ pub fn completeMeshHolesWithTransformer(
         const h = img.height;
 
         // Rasterize accumulated mesh before inference so already-complete intermediate views skip ONNX
+        const t_dyn0 = nowMs.stamp(config.io);
         var dyn_ren: ?render.RenderedView = if (view_step > 0 and pts_acc.items.len > base_vert_count)
             try render.renderMeshView(allocator, w, h, k, pose, pts_acc.items, cols_acc.items, faces_acc.items)
         else
             null;
+        if (config.timings) |tm| tm.prerender_ms += nowMs.elapsed(config.io, t_dyn0);
         defer if (dyn_ren) |*dr| dr.deinit(allocator);
         const cur_ren = if (dyn_ren) |dr| dr else base_ren;
 
@@ -1313,8 +1562,12 @@ pub fn completeMeshHolesWithTransformer(
         const target_w = roundUpDiv14(@intFromFloat(@max(112.0, @as(f64, @floatFromInt(w)) * scale_in)));
         const target_h = roundUpDiv14(@intFromFloat(@max(112.0, @as(f64, @floatFromInt(h)) * scale_in)));
 
+        const t_inf0 = nowMs.stamp(config.io);
         var pred = try sess.predict(allocator, img.rgb, w, h, target_w, target_h, config.num_tokens);
+        if (config.timings) |tm| tm.infer_ms += nowMs.elapsed(config.io, t_inf0);
         defer pred.deinit(allocator);
+
+        const t_st0 = nowMs.stamp(config.io);
 
         // Fit global affine (scale, shift) across all depth scales combining dense SfM renders and unoccluded sparse SfM vertices
         var fit_pred_list: std.ArrayList(f32) = .empty;
@@ -1423,27 +1676,29 @@ pub fn completeMeshHolesWithTransformer(
             fit_weights[fi] = if (is_ok) src_mult / @max(@as(f64, 16.0), @as(f64, @floatFromInt(bin_cnt[b_idx]))) else 0.0;
         }
 
-        const fit = fitMonotoneQuadDepthWeightedIrlS(
+        const fit = fitDepthAlignment(
             fit_pred_list.items,
             fit_tgt_list.items,
             fit_ok_list.items,
             fit_weights,
-        ) orelse continue;
+        ) orelse {
+            if (config.timings) |tm| tm.stitch_ms += nowMs.elapsed(config.io, t_st0);
+            continue;
+        };
 
         var n_sparse_far: usize = 0;
         var sparse_far_abs: f64 = 0;
         for (fit_pred_list.items[dense_sample_len..sparse_end_len], fit_tgt_list.items[dense_sample_len..sparse_end_len]) |pz, tz| {
             if (tz >= 9.0) {
-                const p_d: f64 = pz;
-                sparse_far_abs += @abs((fit.quad * p_d + fit.scale) * p_d + fit.shift - @as(f64, tz));
+                sparse_far_abs += @abs(fit.evalDepth(pz) - @as(f64, tz));
                 n_sparse_far += 1;
             }
         }
         const far_mae = if (n_sparse_far > 0) sparse_far_abs / @as(f64, @floatFromInt(n_sparse_far)) else 0.0;
 
         std.log.info(
-            "Transformer cam {d:02} ({d}x{d}): scale={d:.3} shift={d:.3} quad={d:.3} metric_scale={d:.3} mean_fit_err={d:.4} far_sparse({d})_mae={d:.3}",
-            .{ ci, pred.width, pred.height, fit.scale, fit.shift, fit.quad, pred.metric_scale, fit.mad_residual, n_sparse_far, far_mae },
+            "Transformer cam {d:02} ({d}x{d} {s}): scale={d:.3} shift={d:.3} quad={d:.3} metric_scale={d:.3} mean_fit_err={d:.4} far_sparse({d})_mae={d:.3}",
+            .{ ci, pred.width, pred.height, if (fit.is_disparity) "disp" else "depth", fit.scale, fit.shift, fit.quad, pred.metric_scale, fit.mad_residual, n_sparse_far, far_mae },
         );
 
         const step: usize = @max(@as(usize, 6), @as(usize, @min(w, h)) / config.grid_target_nodes_short);
@@ -1481,8 +1736,7 @@ pub fn completeMeshHolesWithTransformer(
                 const fx_pred = @as(f64, @floatFromInt(px)) * sx_pred;
                 const pz = sampleBilinear(pred.depth, pred.width, pred.height, fx_pred, py_pred);
                 mask[gi] = sampleBilinear(pred.mask, pred.width, pred.height, fx_pred, py_pred);
-                const p_d: f64 = pz;
-                z_global[gi] = @floatCast((fit.quad * p_d + fit.scale) * p_d + fit.shift);
+                z_global[gi] = @floatCast(fit.evalDepth(pz));
             }
         }
 
@@ -1521,6 +1775,7 @@ pub fn completeMeshHolesWithTransformer(
             try cols_acc.appendSlice(allocator, patch.cols);
             try faces_acc.appendSlice(allocator, patch.faces);
         }
+        if (config.timings) |tm| tm.stitch_ms += nowMs.elapsed(config.io, t_st0);
         std.log.info("Transformer stitched {d} hole vertices, {d} triangles from cam {d:02}", .{
             patch.pts.len,
             patch.faces.len,
@@ -1613,6 +1868,28 @@ test "fillResizedNchw01 and fitAffineDepthIrlS recover affine transform with out
     const qfit = fitMonotoneQuadDepthWeightedIrlS(&b_pred, &b_tgt, &b_ok, &b_w).?;
     try std.testing.expectApproxEqAbs(@as(f64, 0.35), qfit.quad, 0.04);
     try std.testing.expectApproxEqAbs(@as(f64, 3.2), qfit.scale, 0.15);
+
+    // ImageNet normalization + inverse-depth (disparity) alignment
+    var norm_out: [3 * 2 * 2]f32 = undefined;
+    fillResizedNchwImageNet(&rgb, 2, 2, 2, 2, &norm_out);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.485 / 0.229), norm_out[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, (1.0 - 0.485) / 0.229), norm_out[1], 1e-4);
+
+    for (0..30) |i| {
+        const z: f64 = 2.5 + 0.15 * @as(f64, @floatFromInt(i));
+        b_pred[i] = @floatCast(((1.0 / z) - 0.02) / 0.8);
+        b_tgt[i] = @floatCast(z);
+        b_w[i] = 1.0 / 30.0;
+    }
+    for (30..40) |i| {
+        const z: f64 = 10.0 + 1.0 * @as(f64, @floatFromInt(i - 30));
+        b_pred[i] = @floatCast(((1.0 / z) - 0.02) / 0.8);
+        b_tgt[i] = @floatCast(z);
+        b_w[i] = 1.0 / 10.0;
+    }
+    const dfit = fitDepthAlignment(&b_pred, &b_tgt, &b_ok, &b_w).?;
+    try std.testing.expect(dfit.is_disparity);
+    try std.testing.expectApproxEqAbs(@as(f64, b_tgt[35]), dfit.evalDepth(b_pred[35]), 0.15);
 }
 
 test "selectBalancedViewIndices and extractHolePatchFromGrid stitch holes with camera-facing normals and cliff rejection" {
@@ -1707,11 +1984,11 @@ test "selectBalancedViewIndices and extractHolePatchFromGrid stitch holes with c
     }
 }
 
-test "MoGe-2 ONNX model loads and predicts 3D geometry via Zig when present" {
+fn verifyOnnxModelSmoke(model_path: []const u8) !void {
     const gpa = std.testing.allocator;
-    std.Io.Dir.cwd().access(std.testing.io, "models/moge-2-vitb-normal.onnx", .{}) catch return;
+    std.Io.Dir.cwd().access(std.testing.io, model_path, .{}) catch return;
 
-    var sess = try NeuralSession.init(gpa, "models/moge-2-vitb-normal.onnx", 4);
+    var sess = try NeuralSession.init(gpa, model_path, 4);
     defer sess.deinit();
 
     try std.testing.expect(sess.in_names_z.len >= 1);
@@ -1743,4 +2020,10 @@ test "MoGe-2 ONNX model loads and predicts 3D geometry via Zig when present" {
         }
     }
     try std.testing.expect(any_finite_pos);
+}
+
+test "MoGe-2 and Depth Anything ONNX models load and predict depth when present" {
+    try verifyOnnxModelSmoke("models/moge-2-vitb-normal.onnx");
+    try verifyOnnxModelSmoke("models/depth-anything-v3-base/model.onnx");
+    try verifyOnnxModelSmoke("models/depth-anything-v2-base.onnx");
 }

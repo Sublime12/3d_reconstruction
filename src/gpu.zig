@@ -260,6 +260,139 @@ const harris_wgsl =
     \\}
 ;
 
+pub const DeviceHandle = struct {
+    instance: c.WGPUInstance,
+    adapter: c.WGPUAdapter,
+    device: c.WGPUDevice,
+    queue: c.WGPUQueue,
+    adapter_name_buf: [256]u8 = undefined,
+    adapter_name_len: usize = 0,
+    backend_type: u32 = 0,
+    adapter_type: u32 = 0,
+
+    pub fn deinit(self: *DeviceHandle) void {
+        c.wgpuQueueRelease(self.queue);
+        c.wgpuDeviceRelease(self.device);
+        c.wgpuAdapterRelease(self.adapter);
+        c.wgpuInstanceRelease(self.instance);
+        self.* = undefined;
+    }
+};
+
+pub fn initDeviceContext() !DeviceHandle {
+    const inst_desc = std.mem.zeroes(c.WGPUInstanceDescriptor);
+    const instance = c.wgpuCreateInstance(&inst_desc) orelse return error.GpuInitFailed;
+    errdefer c.wgpuInstanceRelease(instance);
+
+    const AdapterState = struct {
+        done: bool = false,
+        status: c.WGPURequestAdapterStatus = c.WGPURequestAdapterStatus_Unknown,
+        adapter: c.WGPUAdapter = null,
+    };
+    var adapter_state = AdapterState{};
+    const adapter_cb = struct {
+        fn cb(
+            status: c.WGPURequestAdapterStatus,
+            adapter: c.WGPUAdapter,
+            _: c.WGPUStringView,
+            userdata1: ?*anyopaque,
+            _: ?*anyopaque,
+        ) callconv(.c) void {
+            const st: *AdapterState = @ptrCast(@alignCast(userdata1.?));
+            st.status = status;
+            st.adapter = adapter;
+            st.done = true;
+        }
+    }.cb;
+
+    var req_opts = std.mem.zeroes(c.WGPURequestAdapterOptions);
+    req_opts.powerPreference = c.WGPUPowerPreference_HighPerformance;
+    req_opts.backendType = c.WGPUBackendType_Vulkan;
+    _ = c.wgpuInstanceRequestAdapter(instance, &req_opts, .{
+        .nextInChain = null,
+        .mode = c.WGPUCallbackMode_AllowSpontaneous,
+        .callback = adapter_cb,
+        .userdata1 = &adapter_state,
+        .userdata2 = null,
+    });
+    while (!adapter_state.done) c.wgpuInstanceProcessEvents(instance);
+
+    if (adapter_state.status != c.WGPURequestAdapterStatus_Success or adapter_state.adapter == null) {
+        return error.GpuAdapterUnavailable;
+    }
+    const adapter = adapter_state.adapter;
+    errdefer c.wgpuAdapterRelease(adapter);
+
+    var handle = DeviceHandle{
+        .instance = instance,
+        .adapter = adapter,
+        .device = undefined,
+        .queue = undefined,
+    };
+    var info = std.mem.zeroes(c.WGPUAdapterInfo);
+    if (c.wgpuAdapterGetInfo(adapter, &info) == c.WGPUStatus_Success) {
+        defer c.wgpuAdapterInfoFreeMembers(info);
+        if (info.device.data != null and info.device.length > 0) {
+            handle.adapter_name_len = @min(handle.adapter_name_buf.len, info.device.length);
+            @memcpy(handle.adapter_name_buf[0..handle.adapter_name_len], info.device.data[0..handle.adapter_name_len]);
+        }
+        handle.backend_type = @intCast(info.backendType);
+        handle.adapter_type = @intCast(info.adapterType);
+    }
+
+    const DeviceState = struct {
+        done: bool = false,
+        status: c.WGPURequestDeviceStatus = c.WGPURequestDeviceStatus_Unknown,
+        device: c.WGPUDevice = null,
+    };
+    var device_state = DeviceState{};
+    const device_cb = struct {
+        fn cb(
+            status: c.WGPURequestDeviceStatus,
+            device: c.WGPUDevice,
+            _: c.WGPUStringView,
+            userdata1: ?*anyopaque,
+            _: ?*anyopaque,
+        ) callconv(.c) void {
+            const st: *DeviceState = @ptrCast(@alignCast(userdata1.?));
+            st.status = status;
+            st.device = device;
+            st.done = true;
+        }
+    }.cb;
+
+    var dev_desc = std.mem.zeroes(c.WGPUDeviceDescriptor);
+    dev_desc.label = wgpuStr("sfm_gpu_device");
+    dev_desc.defaultQueue.label = wgpuStr("sfm_gpu_queue");
+    dev_desc.deviceLostCallbackInfo = .{
+        .nextInChain = null,
+        .mode = c.WGPUCallbackMode_AllowSpontaneous,
+        .callback = null,
+        .userdata1 = null,
+        .userdata2 = null,
+    };
+    _ = c.wgpuAdapterRequestDevice(adapter, &dev_desc, .{
+        .nextInChain = null,
+        .mode = c.WGPUCallbackMode_AllowSpontaneous,
+        .callback = device_cb,
+        .userdata1 = &device_state,
+        .userdata2 = null,
+    });
+    while (!device_state.done) c.wgpuInstanceProcessEvents(instance);
+
+    if (device_state.status != c.WGPURequestDeviceStatus_Success or device_state.device == null) {
+        return error.GpuDeviceFailed;
+    }
+    const device = device_state.device;
+    errdefer c.wgpuDeviceRelease(device);
+    const queue = c.wgpuDeviceGetQueue(device) orelse return error.GpuQueueFailed;
+    errdefer c.wgpuQueueRelease(queue);
+
+    handle.device = device;
+    handle.queue = queue;
+    return handle;
+}
+
 pub const GpuContext = struct {
     instance: c.WGPUInstance,
     adapter: c.WGPUAdapter,
@@ -283,107 +416,9 @@ pub const GpuContext = struct {
     }
 
     pub fn init() !GpuContext {
-        const inst_desc = std.mem.zeroes(c.WGPUInstanceDescriptor);
-        const instance = c.wgpuCreateInstance(&inst_desc) orelse return error.GpuInitFailed;
-        errdefer c.wgpuInstanceRelease(instance);
-
-        const AdapterState = struct {
-            done: bool = false,
-            status: c.WGPURequestAdapterStatus = c.WGPURequestAdapterStatus_Unknown,
-            adapter: c.WGPUAdapter = null,
-        };
-        var adapter_state = AdapterState{};
-        const adapter_cb = struct {
-            fn cb(
-                status: c.WGPURequestAdapterStatus,
-                adapter: c.WGPUAdapter,
-                _: c.WGPUStringView,
-                userdata1: ?*anyopaque,
-                _: ?*anyopaque,
-            ) callconv(.c) void {
-                const st: *AdapterState = @ptrCast(@alignCast(userdata1.?));
-                st.status = status;
-                st.adapter = adapter;
-                st.done = true;
-            }
-        }.cb;
-
-        var req_opts = std.mem.zeroes(c.WGPURequestAdapterOptions);
-        req_opts.powerPreference = c.WGPUPowerPreference_HighPerformance;
-        req_opts.backendType = c.WGPUBackendType_Vulkan;
-        _ = c.wgpuInstanceRequestAdapter(instance, &req_opts, .{
-            .nextInChain = null,
-            .mode = c.WGPUCallbackMode_AllowSpontaneous,
-            .callback = adapter_cb,
-            .userdata1 = &adapter_state,
-            .userdata2 = null,
-        });
-        while (!adapter_state.done) c.wgpuInstanceProcessEvents(instance);
-
-        if (adapter_state.status != c.WGPURequestAdapterStatus_Success or adapter_state.adapter == null) {
-            return error.GpuAdapterUnavailable;
-        }
-        const adapter = adapter_state.adapter;
-        errdefer c.wgpuAdapterRelease(adapter);
-
-        var name_buf: [256]u8 = undefined;
-        var name_len: usize = 0;
-        var info = std.mem.zeroes(c.WGPUAdapterInfo);
-        if (c.wgpuAdapterGetInfo(adapter, &info) == c.WGPUStatus_Success) {
-            defer c.wgpuAdapterInfoFreeMembers(info);
-            if (info.device.data != null and info.device.length > 0) {
-                name_len = @min(name_buf.len, info.device.length);
-                @memcpy(name_buf[0..name_len], info.device.data[0..name_len]);
-            }
-        }
-
-        const DeviceState = struct {
-            done: bool = false,
-            status: c.WGPURequestDeviceStatus = c.WGPURequestDeviceStatus_Unknown,
-            device: c.WGPUDevice = null,
-        };
-        var device_state = DeviceState{};
-        const device_cb = struct {
-            fn cb(
-                status: c.WGPURequestDeviceStatus,
-                device: c.WGPUDevice,
-                _: c.WGPUStringView,
-                userdata1: ?*anyopaque,
-                _: ?*anyopaque,
-            ) callconv(.c) void {
-                const st: *DeviceState = @ptrCast(@alignCast(userdata1.?));
-                st.status = status;
-                st.device = device;
-                st.done = true;
-            }
-        }.cb;
-
-        var dev_desc = std.mem.zeroes(c.WGPUDeviceDescriptor);
-        dev_desc.label = wgpuStr("sfm_gpu_device");
-        dev_desc.defaultQueue.label = wgpuStr("sfm_gpu_queue");
-        dev_desc.deviceLostCallbackInfo = .{
-            .nextInChain = null,
-            .mode = c.WGPUCallbackMode_AllowSpontaneous,
-            .callback = null,
-            .userdata1 = null,
-            .userdata2 = null,
-        };
-        _ = c.wgpuAdapterRequestDevice(adapter, &dev_desc, .{
-            .nextInChain = null,
-            .mode = c.WGPUCallbackMode_AllowSpontaneous,
-            .callback = device_cb,
-            .userdata1 = &device_state,
-            .userdata2 = null,
-        });
-        while (!device_state.done) c.wgpuInstanceProcessEvents(instance);
-
-        if (device_state.status != c.WGPURequestDeviceStatus_Success or device_state.device == null) {
-            return error.GpuDeviceFailed;
-        }
-        const device = device_state.device;
-        errdefer c.wgpuDeviceRelease(device);
-        const queue = c.wgpuDeviceGetQueue(device) orelse return error.GpuQueueFailed;
-        errdefer c.wgpuQueueRelease(queue);
+        var dev = try initDeviceContext();
+        errdefer dev.deinit();
+        const device = dev.device;
 
         const match_sm = createShaderModule(device, "match_shader", match_wgsl) orelse return error.GpuShaderCompileFailed;
         defer c.wgpuShaderModuleRelease(match_sm);
@@ -434,11 +469,11 @@ pub const GpuContext = struct {
         const harris_pipeline = createComputePipeline(device, "harris_pipe", harris_pl, harris_sm, "harris_score") orelse return error.GpuPipelineFailed;
         errdefer c.wgpuComputePipelineRelease(harris_pipeline);
 
-        var ctx: GpuContext = .{
-            .instance = instance,
-            .adapter = adapter,
-            .device = device,
-            .queue = queue,
+        return .{
+            .instance = dev.instance,
+            .adapter = dev.adapter,
+            .device = dev.device,
+            .queue = dev.queue,
             .match_bgl = match_bgl,
             .match_pl = match_pl,
             .match_pipeline = match_pipeline,
@@ -447,12 +482,11 @@ pub const GpuContext = struct {
             .blur_h_pipeline = blur_h_pipeline,
             .blur_v_pipeline = blur_v_pipeline,
             .harris_pipeline = harris_pipeline,
-            .adapter_name_len = name_len,
-            .backend_type = @intCast(info.backendType),
-            .adapter_type = @intCast(info.adapterType),
+            .adapter_name_buf = dev.adapter_name_buf,
+            .adapter_name_len = dev.adapter_name_len,
+            .backend_type = dev.backend_type,
+            .adapter_type = dev.adapter_type,
         };
-        if (name_len > 0) @memcpy(ctx.adapter_name_buf[0..name_len], name_buf[0..name_len]);
-        return ctx;
     }
 
     pub fn deinit(self: *GpuContext) void {
@@ -818,15 +852,15 @@ pub const GpuContext = struct {
     }
 };
 
-fn wgpuStr(s: []const u8) c.WGPUStringView {
+pub fn wgpuStr(s: []const u8) c.WGPUStringView {
     return .{ .data = s.ptr, .length = s.len };
 }
 
-inline fn alignUp(n: usize, a: usize) usize {
+pub inline fn alignUp(n: usize, a: usize) usize {
     return (n + a - 1) & ~(a - 1);
 }
 
-fn createShaderModule(device: c.WGPUDevice, label: []const u8, wgsl_src: []const u8) c.WGPUShaderModule {
+pub fn createShaderModule(device: c.WGPUDevice, label: []const u8, wgsl_src: []const u8) c.WGPUShaderModule {
     var wgsl_desc = std.mem.zeroes(c.WGPUShaderSourceWGSL);
     wgsl_desc.chain = .{
         .next = null,
@@ -840,7 +874,7 @@ fn createShaderModule(device: c.WGPUDevice, label: []const u8, wgsl_src: []const
     return c.wgpuDeviceCreateShaderModule(device, &sm_desc);
 }
 
-fn bufferLayoutEntry(binding: u32, buf_type: c.WGPUBufferBindingType, has_dynamic_offset: bool) c.WGPUBindGroupLayoutEntry {
+pub fn bufferLayoutEntry(binding: u32, buf_type: c.WGPUBufferBindingType, has_dynamic_offset: bool) c.WGPUBindGroupLayoutEntry {
     var e = std.mem.zeroes(c.WGPUBindGroupLayoutEntry);
     e.binding = binding;
     e.visibility = c.WGPUShaderStage_Compute;
@@ -853,7 +887,7 @@ fn bufferLayoutEntry(binding: u32, buf_type: c.WGPUBufferBindingType, has_dynami
     return e;
 }
 
-fn createPipelineLayout(device: c.WGPUDevice, label: []const u8, bgl: c.WGPUBindGroupLayout) c.WGPUPipelineLayout {
+pub fn createPipelineLayout(device: c.WGPUDevice, label: []const u8, bgl: c.WGPUBindGroupLayout) c.WGPUPipelineLayout {
     const bgls = [1]c.WGPUBindGroupLayout{bgl};
     return c.wgpuDeviceCreatePipelineLayout(device, &.{
         .nextInChain = null,
@@ -863,7 +897,7 @@ fn createPipelineLayout(device: c.WGPUDevice, label: []const u8, bgl: c.WGPUBind
     });
 }
 
-fn createComputePipeline(
+pub fn createComputePipeline(
     device: c.WGPUDevice,
     label: []const u8,
     layout: c.WGPUPipelineLayout,
@@ -884,7 +918,7 @@ fn createComputePipeline(
     });
 }
 
-fn createBuffer(device: c.WGPUDevice, size: usize, usage: c.WGPUBufferUsage) !c.WGPUBuffer {
+pub fn createBuffer(device: c.WGPUDevice, size: usize, usage: c.WGPUBufferUsage) !c.WGPUBuffer {
     const buf = c.wgpuDeviceCreateBuffer(device, &.{
         .nextInChain = null,
         .label = wgpuStr("sfm_buf"),
@@ -895,12 +929,12 @@ fn createBuffer(device: c.WGPUDevice, size: usize, usage: c.WGPUBufferUsage) !c.
     return buf;
 }
 
-fn releaseBuffer(buf: c.WGPUBuffer) void {
+pub fn releaseBuffer(buf: c.WGPUBuffer) void {
     c.wgpuBufferDestroy(buf);
     c.wgpuBufferRelease(buf);
 }
 
-fn bufEntry(binding: u32, buf: c.WGPUBuffer, offset: u64, size: u64) c.WGPUBindGroupEntry {
+pub fn bufEntry(binding: u32, buf: c.WGPUBuffer, offset: u64, size: u64) c.WGPUBindGroupEntry {
     var e = std.mem.zeroes(c.WGPUBindGroupEntry);
     e.binding = binding;
     e.buffer = buf;
@@ -909,7 +943,7 @@ fn bufEntry(binding: u32, buf: c.WGPUBuffer, offset: u64, size: u64) c.WGPUBindG
     return e;
 }
 
-fn mapReadCopy(
+pub fn mapReadCopy(
     instance: c.WGPUInstance,
     device: c.WGPUDevice,
     staging: c.WGPUBuffer,
