@@ -1,13 +1,13 @@
 # 3d_reconstruction
 
-An end-to-end 3D Structure-from-Motion (SfM), textured surface meshing, WebGPU compute-accelerated, neural 3D Transformer hole-completion, and interactive OpenGL camera-viewer pipeline written in Zig.
+An end-to-end 3D Structure-from-Motion (SfM), textured surface meshing, WebGPU compute-accelerated, neural 3D Transformer hole-completion, from-scratch Instant-NGP NeRF + Marching Cubes, and interactive OpenGL camera-viewer pipeline written in Zig.
 
 ![Reconstructed 3D Fountain Mesh and Camera Frustums](assets/reconstruction.gif)
 *Reconstructed `fountain-p11` mesh (`934,393` vertices / `1,795,088` triangles) with all 11 recovered camera frustums (green) and MoGe-2 neural hole completion.*
 
 ## Overview
 
-Starting from a calibrated multi-view photo collection (`K.txt` + images), **`3d_reconstruction`** reconstructs camera poses, a sparse 3D point cloud, and a completed, photo-textured triangle mesh exported to ASCII `.ply`:
+Starting from a calibrated multi-view photo collection (`K.txt` + images), **`3d_reconstruction`** reconstructs camera poses, a sparse 3D point cloud, and either a photo-textured triangle mesh or a volumetric Instant-NGP NeRF exported to ASCII `.ply`:
 
 1. **Multi-Scale Feature Extraction & Matching ([`src/features.zig`](src/features.zig), [`src/gpu.zig`](src/gpu.zig))**
    - Tiled Harris corner detection (`detectAndCompute`) and binary descriptor matching.
@@ -19,7 +19,10 @@ Starting from a calibrated multi-view photo collection (`K.txt` + images), **`3d
 4. **Optional 3D Transformer Hole Completion ([`src/neural_depth.zig`](src/neural_depth.zig))**
    - Optional `--nn-model <onnx>` pass using native bindings to **ONNX Runtime** (`c_ort.h`) supporting **MoGe-2 ViT-B** (`moge-2-vitb-normal.onnx`), **Depth Anything 2 Base** (`depth-anything-v2-base.onnx`), and **Depth Anything 3 Base** (`depth-anything-v3-base/model.onnx`).
    - Schedules viewpoints widest-hole-first, aligns both direct depth (`+Z`, via `fitAffineDepthWeightedIrlS` / `fitMonotoneQuadDepthWeightedIrlS`) and relative inverse disparity (`1/Z`, via `fitDisparityDepthWeightedIrlS`) to SfM scale across 16 log-depth octave bins, and stitches hole surfaces on a regular grid with silhouette depth-jump guards.
-5. **Photometric Verification & Interactive Viewer ([`src/render.zig`](src/render.zig), [`src/viewer.zig`](src/viewer.zig), [`src/viewer_math.zig`](src/viewer_math.zig))**
+5. **From-Scratch Instant-NGP NeRF & Marching Cubes Export ([`src/nerf.zig`](src/nerf.zig), [`src/nerf_gpu.zig`](src/nerf_gpu.zig), [`src/marching_cubes.zig`](src/marching_cubes.zig))**
+   - Optional `--nerf` pipeline training a multi-resolution spatial `HashGrid` (`12` levels, `2^18` table size on GPU) with spherical-harmonics view conditioning, two-layer geometry/color MLPs, Adam optimization, and dense SfM depth-seeded `OccupancyGrid` culling.
+   - Runs either on CPU threads (`--threads <n>`) or on GPU via embedded WGSL compute shaders (`src/nerf_*.wgsl` through `wgpu-native`), then extracts a smoothed, camera-visible triangle mesh via Marching Cubes (`extractMesh`).
+6. **Photometric Verification & Interactive Viewer ([`src/render.zig`](src/render.zig), [`src/viewer.zig`](src/viewer.zig), [`src/viewer_math.zig`](src/viewer_math.zig))**
    - `--verify-views <dir>` renders each registered camera, held-out view, and interpolated novel viewpoint with Coverage, MAE, RMSE, PSNR, and SSIM reports.
    - Standalone OpenGL + GLFW viewer (`sfm_viewer`) with Free Orbit mode and click-to-enter **First-Person Camera mode** aligned to any reconstructed camera's pose, intrinsics FOV, look rotation, local displacement, photo PiP reference, and aligned photo overlay.
 
@@ -49,6 +52,7 @@ zig build -Doptimize=ReleaseFast
 ### Reconstruction CLI (`3d_reconstruction`)
 
 ```bash
+# SfM + MoGe-2 ONNX hole-completed textured mesh
 ./zig-out/bin/3d_reconstruction \
   --data data/fountain-p11 \
   --threads 8 \
@@ -56,6 +60,16 @@ zig build -Doptimize=ReleaseFast
   --nn-model models/moge-2-vitb-normal.onnx \
   --out output/fountain_nn.ply \
   --verify-views output/views_nn
+
+# WebGPU Instant-NGP NeRF training + Marching Cubes .ply export
+./zig-out/bin/3d_reconstruction \
+  --data data/fountain-p11 \
+  --threads 8 \
+  --gpu \
+  --nerf \
+  --nerf-steps 2000 \
+  --out output/fountain_nerf.ply \
+  --verify-views output/views_nerf
 ```
 
 | Flag | Default | Description |
@@ -63,9 +77,11 @@ zig build -Doptimize=ReleaseFast
 | `--data <dir>` | `data/fountain-p11` | Input directory containing `K.txt` and images (`.png`, `.jpg`, `.jpeg`) |
 | `--out <ply>` | `output/reconstruction.ply` | Output ASCII `.ply` mesh with camera metadata |
 | `--max-dim <px>` | `1200` | Downscale longest image edge to `<px>` before SfM |
-| `--threads <n>` | `1` | Worker threads for SfM and ONNX Runtime intra-op execution |
-| `--gpu` | `false` | Enable WebGPU compute acceleration for feature detection and matching |
+| `--threads <n>` | `1` | Worker threads for SfM, ONNX Runtime, CPU NeRF, and Marching Cubes |
+| `--gpu` | `false` | Enable WebGPU compute acceleration for feature detection, matching, and NeRF |
 | `--nn-model <onnx>` | *none* | Path to local ONNX 3D Transformer depth model for hole completion |
+| `--nerf` | `false` | Train Instant-NGP NeRF from SfM poses and export a Marching Cubes `.ply` |
+| `--nerf-steps <n>` | `1500` | Number of Instant-NGP training steps |
 | `--verify-views <dir>` | *none* | Render real/virtual/holdout/novel `.ppm` views and print PSNR/SSIM/coverage |
 
 ### Interactive 3D & Camera Viewer (`sfm_viewer`)
@@ -85,9 +101,26 @@ zig build -Doptimize=ReleaseFast
 
 ## Benchmark Snapshot (`fountain-p11`, 11 x `1200x800` images, `-Doptimize=ReleaseFast`)
 
-Measured on `11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz` (`4C/8T`), `Intel Iris Xe Graphics` (WebGPU), `15 GiB` RAM:
+### Test Machine Specs
+
+- **System:** `ASUS VivoBook X513EAN` (`ASUSTeK COMPUTER INC.`, `X513EAN_X513EA`)
+- **OS / Kernel:** `Debian GNU/Linux 12 (bookworm)` (`Linux 6.1.0-40-amd64`, `x86_64`)
+- **CPU:** `11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz` (`4` cores / `8` threads, max `4.70 GHz`, `5 MiB` L2 / `12 MiB` L3 cache, AVX2 / AVX-512)
+- **GPU / WebGPU Backend:** `Intel(R) Iris(R) Xe Graphics (TGL GT2)` (`i915`, `Mesa 25.0.7-2~bpo12+1`, Vulkan `1.4.305` via `wgpu-native`)
+- **Memory:** `15 GiB` RAM (`959 MiB` swap)
+- **Compiler:** `Zig 0.17.1`
+
+### Base SfM & ONNX Mesh Completion Comparison
 
 ![Input vs Base SfM vs WebGPU + MoGe-2 ONNX](assets/comparison.png)
+
+### WebGPU Instant-NGP NeRF Reconstruction (`--nerf --gpu --nerf-steps 2000`)
+
+![Instant-NGP NeRF 2D View Synthesis and Unseen Holdout](assets/nerf_comparison.png)
+*2D NeRF renders (`12` hash levels, `table_log2=18`, `2048` rays/step): `27.51 dB` mean `PSNR` / `0.6918` `SSIM` across all 11 registered views (`100.0%` coverage), and `24.42 dB` / `0.5944` `SSIM` on unseen Holdout `Cam 05`.*
+
+![Extracted NeRF Marching Cubes 3D Mesh](assets/nerf_mesh.png)
+*Extracted `output/fountain_nerf.ply` isosurface (`242,010` vertices / `451,546` triangles, `320³` Marching Cubes, `19 MB`) rendered via Z-buffered triangle rasterization from `Cam 05` (`91.0%` cov), `Cam 10` (`72.1%` cov), and an oblique 3D viewpoint (`91.0%` cov).*
 
 ### End-to-End Reconstruction & View Synthesis Quality
 
@@ -99,22 +132,25 @@ Measured on `11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz` (`4C/8T`), `Intel I
 | WebGPU + **Depth Anything 2 Base** | `14794.8 ms` (`2899.0 ms`) | `951,213` / `1,826,832` | `97.9%` | `24.85 dB` | `0.7327` |
 | WebGPU + **Depth Anything 3 Base** | `19153.3 ms` (`2837.0 ms`) | `912,066` / `1,747,248` | `97.4%` | `24.04 dB` | `0.7248` |
 | WebGPU + **MoGe-2 ViT-B** | `46607.6 ms` (`2891.6 ms`) | `934,393` / `1,795,088` | `97.9%` | `24.93 dB` | `0.7402` |
+| WebGPU + **Instant-NGP NeRF** (`2000` steps) | `434311.0 ms` (`2863.3 ms`) | `242,010` / `451,546` | `100.0%` *(2D)* / `24.42 dB` *(holdout)* | `27.51 dB` | `0.6918` |
 
 ### Per-Step Speed Breakdown (`ms`, `--threads 8` unless noted)
 
-| Step | CPU (`1T`) | CPU (`8T`) | WebGPU (`8T`) | WebGPU + DA2 Base | WebGPU + DA3 Base | WebGPU + MoGe-2 |
-| --- | --- | --- | --- | --- | --- | --- |
-| Image Load (`11 x 1200x800`) | `672.5` | `675.4` | `674.3` | `662.8` | `662.8` | `647.9` |
-| WebGPU Init | `0.0` | `0.0` | `72.8` | `74.4` | `71.9` | `71.9` |
-| Feature Detection | `640.1` | `173.4` | `222.7` | `267.9` | `215.6` | `254.3` |
-| Match & Geometric Verify | `11686.7` | `2930.4` | `1359.4` | `1374.5` | `1371.6` | `1356.4` |
-| Incremental BA | `721.4` | `660.4` | `644.8` | `645.8` | `653.3` | `682.4` |
-| Guided Densify | `1592.2` | `452.1` | `446.1` | `452.4` | `449.3` | `449.8` |
-| Final Bundle Adjust | `71.8` | `68.1` | `69.4` | `73.9` | `65.1` | `66.2` |
-| Surface Mesh (`Delaunay + Bridge + Loops`) | `130.8` | `124.1` | `124.3` | `126.1` | `123.8` | `124.5` |
-| NN Init + Prerender (`11` views) | `0.0` | `0.0` | `0.0` | `931.1` | `1101.4` | `1083.7` |
-| **NN Inference (`504x336` ONNX CPU)** | `0.0` | `0.0` | `0.0` | **`9040.0`** | **`10503.5`** | **`39038.7`** |
-| NN Stitch + Post Loops | `0.0` | `0.0` | `0.0` | `267.4` | `284.2` | `300.5` |
-| Texture Projection | `293.3` | `279.3` | `278.0` | `640.3` | `592.2` | `618.4` |
-| ASCII `.ply` Export | `65.4` | `60.0` | `56.5` | `218.9` | `3034.7` | `1888.6` |
-| **Total End-to-End** | **`15878.2`** | **`5427.0`** | **`3958.4`** | **`14794.8`** | **`19153.3`** | **`46607.6`** |
+| Step | CPU (`1T`) | CPU (`8T`) | WebGPU (`8T`) | WebGPU + DA2 Base | WebGPU + DA3 Base | WebGPU + MoGe-2 | WebGPU + NeRF (`2000`) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Image Load (`11 x 1200x800`) | `672.5` | `675.4` | `674.3` | `662.8` | `662.8` | `647.9` | `656.7` |
+| WebGPU Init | `0.0` | `0.0` | `72.8` | `74.4` | `71.9` | `71.9` | `50.6` |
+| Feature Detection | `640.1` | `173.4` | `222.7` | `267.9` | `215.6` | `254.3` | `300.9` |
+| Match & Geometric Verify | `11686.7` | `2930.4` | `1359.4` | `1374.5` | `1371.6` | `1356.4` | `1364.1` |
+| Incremental BA | `721.4` | `660.4` | `644.8` | `645.8` | `653.3` | `682.4` | `647.9` |
+| Guided Densify | `1592.2` | `452.1` | `446.1` | `452.4` | `449.3` | `449.8` | `424.2` |
+| Final Bundle Adjust | `71.8` | `68.1` | `69.4` | `73.9` | `65.1` | `66.2` | `65.7` |
+| Surface Mesh (`Delaunay + Bridge + Loops`) | `130.8` | `124.1` | `124.3` | `126.1` | `123.8` | `124.5` | `0.0` |
+| NN Init + Prerender (`11` views) | `0.0` | `0.0` | `0.0` | `931.1` | `1101.4` | `1083.7` | `0.0` |
+| **NN Inference (`504x336` ONNX CPU)** | `0.0` | `0.0` | `0.0` | **`9040.0`** | **`10503.5`** | **`39038.7`** | `0.0` |
+| NN Stitch + Post Loops | `0.0` | `0.0` | `0.0` | `267.4` | `284.2` | `300.5` | `0.0` |
+| **NeRF Setup + Train (`2000` steps)** | `0.0` | `0.0` | `0.0` | `0.0` | `0.0` | `0.0` | **`428896.0`** |
+| **NeRF Marching Cubes (`320³`, `8T`)** | `0.0` | `0.0` | `0.0` | `0.0` | `0.0` | `0.0` | **`1860.7`** |
+| Texture Projection | `293.3` | `279.3` | `278.0` | `640.3` | `592.2` | `618.4` | `0.0` |
+| ASCII `.ply` Export | `65.4` | `60.0` | `56.5` | `218.9` | `3034.7` | `1888.6` | `639.7` |
+| **Total End-to-End** | **`15878.2`** | **`5427.0`** | **`3958.4`** | **`14794.8`** | **`19153.3`** | **`46607.6`** | **`434967.6`** |
