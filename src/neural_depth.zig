@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c_ort");
 const Vec2 = @import("math/vec.zig").Vec2;
 const Vec3 = @import("math/vec.zig").Vec3;
@@ -10,6 +11,39 @@ const Color = @import("io_ply.zig").Color;
 const mesh_mod = @import("mesh.zig");
 const render = @import("render.zig");
 
+pub const NeuralDevice = enum {
+    cpu,
+    npu,
+    ov_gpu,
+    ov_auto,
+
+    pub fn parse(raw: []const u8) !NeuralDevice {
+        if (std.ascii.eqlIgnoreCase(raw, "cpu")) return .cpu;
+        if (std.ascii.eqlIgnoreCase(raw, "npu")) return .npu;
+        if (std.ascii.eqlIgnoreCase(raw, "gpu") or std.ascii.eqlIgnoreCase(raw, "ov_gpu") or std.ascii.eqlIgnoreCase(raw, "openvino-gpu")) return .ov_gpu;
+        if (std.ascii.eqlIgnoreCase(raw, "auto") or std.ascii.eqlIgnoreCase(raw, "ov_auto")) return .ov_auto;
+        return error.InvalidNeuralDevice;
+    }
+
+    pub fn ovDeviceType(self: NeuralDevice) [:0]const u8 {
+        return switch (self) {
+            .cpu => "CPU",
+            .npu => "NPU",
+            .ov_gpu => "GPU",
+            .ov_auto => "AUTO:NPU,GPU,CPU",
+        };
+    }
+
+    pub fn label(self: NeuralDevice) []const u8 {
+        return switch (self) {
+            .cpu => "CPU",
+            .npu => "NPU (OpenVINO)",
+            .ov_gpu => "GPU (OpenVINO)",
+            .ov_auto => "AUTO (OpenVINO)",
+        };
+    }
+};
+
 pub const NeuralHoleTimings = struct {
     init_ms: f64 = 0,
     prerender_ms: f64 = 0,
@@ -20,6 +54,8 @@ pub const NeuralHoleTimings = struct {
 pub const NeuralHoleConfig = struct {
     model_path: []const u8,
     num_threads: usize = 0,
+    device: NeuralDevice = .cpu,
+    npu_cache_dir: ?[]const u8 = ".zig-cache/ov_npu_cache",
     input_max_dim: u32 = 504,
     num_tokens: i64 = 1800,
     max_views: usize = 11,
@@ -30,6 +66,14 @@ pub const NeuralHoleConfig = struct {
     max_depth_grad_rel: f32 = 0.14,
     io: ?std.Io = null,
     timings: ?*NeuralHoleTimings = null,
+};
+
+pub const NeuralSessionOptions = struct {
+    device: NeuralDevice = .cpu,
+    static_w: u32 = 0,
+    static_h: u32 = 0,
+    cache_dir: ?[]const u8 = null,
+    io: ?std.Io = null,
 };
 
 pub const Prediction = struct {
@@ -58,7 +102,172 @@ pub const NeuralSession = struct {
     input_0_ndim: usize,
     is_imagenet_norm: bool,
     num_tokens_ndim: usize,
+    active_device: NeuralDevice,
+    active_ov_backend: ?[]const u8,
+    static_w: u32,
+    static_h: u32,
+    input_bufs: [2]?[]f32,
+    input_buf_toggle: u1,
     zig_alloc: std.mem.Allocator,
+
+    var npu_runtime_prepared: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+    const DlInfo = extern struct {
+        dli_fname: ?[*:0]const u8,
+        dli_fbase: ?*anyopaque,
+        dli_sname: ?[*:0]const u8,
+        dli_saddr: ?*anyopaque,
+    };
+
+    const linux_dl = if (builtin.os.tag == .linux) struct {
+        extern "c" fn dladdr(addr: ?*const anyopaque, info: *DlInfo) c_int;
+        extern "c" fn dlopen(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque;
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        const RTLD_NOW: c_int = 0x00002;
+        const RTLD_GLOBAL: c_int = 0x00100;
+    } else struct {};
+
+    /// Ensure bundled Level Zero Intel NPU driver and compiler shared libraries
+    /// co-located with `libonnxruntime.so` are discoverable without requiring
+    /// `LD_LIBRARY_PATH` (works around DT_RUNPATH non-inheritance in transitive `dlopen`).
+    fn prepareOpenVinoNpuRuntime() void {
+        if (builtin.os.tag != .linux) return;
+        if (npu_runtime_prepared.swap(true, .acq_rel)) return;
+
+        var info: DlInfo = .{
+            .dli_fname = null,
+            .dli_fbase = null,
+            .dli_sname = null,
+            .dli_saddr = null,
+        };
+        if (linux_dl.dladdr(@ptrCast(&c.OrtGetApiBase), &info) == 0) return;
+        const fname_z = info.dli_fname orelse return;
+        const fname = std.mem.span(fname_z);
+        const dir = std.fs.path.dirname(fname) orelse return;
+
+        var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+
+        const preload_libs = [_][]const u8{
+            "libtbb.so.12",
+            "libopenvino_intel_npu_compiler.so",
+            "libopenvino_intel_npu_compiler_loader.so",
+        };
+        for (preload_libs) |lib_name| {
+            const p = std.fmt.bufPrint(path_buf[0..std.fs.max_path_bytes], "{s}/{s}", .{ dir, lib_name }) catch continue;
+            path_buf[p.len] = 0;
+            const p_z: [:0]const u8 = path_buf[0..p.len :0];
+            _ = linux_dl.dlopen(p_z.ptr, linux_dl.RTLD_NOW | linux_dl.RTLD_GLOBAL);
+        }
+
+        if (std.fmt.bufPrint(path_buf[0..std.fs.max_path_bytes], "{s}/libze_intel_npu.so.1", .{dir})) |ze_driver| {
+            path_buf[ze_driver.len] = 0;
+            const ze_driver_z: [:0]const u8 = path_buf[0..ze_driver.len :0];
+            if (std.c.fopen(ze_driver_z.ptr, "rb")) |fp| {
+                _ = std.c.fclose(fp);
+                _ = linux_dl.setenv("ZE_ENABLE_ALT_DRIVERS", ze_driver_z.ptr, 0);
+            }
+        } else |_| {}
+    }
+
+    const OnnxScanner = struct {
+        extern "c" fn ftell(stream: *std.c.FILE) c_long;
+        extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
+        fn readByte(fp: *std.c.FILE) ?u8 {
+            var b: [1]u8 = undefined;
+            if (std.c.fread(&b, 1, 1, fp) != 1) return null;
+            return b[0];
+        }
+
+        fn readVarint(fp: *std.c.FILE) ?u64 {
+            var res: u64 = 0;
+            var shift: u6 = 0;
+            for (0..10) |_| {
+                const b = readByte(fp) orelse return null;
+                res |= @as(u64, b & 0x7f) << shift;
+                if ((b & 0x80) == 0) return res;
+                if (shift >= 63) return null;
+                shift +|= 7;
+            }
+            return null;
+        }
+
+        fn skipBytes(fp: *std.c.FILE, n: u64) bool {
+            if (n == 0) return true;
+            if (n > std.math.maxInt(c_long)) return false;
+            return fseek(fp, @intCast(n), std.c.SEEK.CUR) == 0;
+        }
+
+        fn skipField(fp: *std.c.FILE, wt: u3) bool {
+            return switch (wt) {
+                0 => readVarint(fp) != null,
+                1 => skipBytes(fp, 8),
+                2 => {
+                    const ln = readVarint(fp) orelse return false;
+                    return skipBytes(fp, ln);
+                },
+                5 => skipBytes(fp, 4),
+                else => false,
+            };
+        }
+
+        /// Fast protobuf header scan (<1 ms even on 400 MB models) checking whether
+        /// the ONNX graph declares a runtime `num_tokens` input (e.g. MoGe-2),
+        /// which creates data-dependent dynamic `Interpolate` shapes that abort
+        /// Intel NPU's static MLIR compiler.
+        fn hasDynamicNumTokensInput(path_z: [:0]const u8) bool {
+            const fp = std.c.fopen(path_z.ptr, "rb") orelse return false;
+            defer _ = std.c.fclose(fp);
+
+            while (readVarint(fp)) |tag| {
+                const fn_num = tag >> 3;
+                const wt: u3 = @truncate(tag & 7);
+                if (fn_num == 7 and wt == 2) {
+                    const graph_len = readVarint(fp) orelse return false;
+                    const g_start = ftell(fp);
+                    if (g_start < 0 or graph_len > std.math.maxInt(c_long)) return false;
+                    const g_end = g_start + @as(c_long, @intCast(graph_len));
+                    while (ftell(fp) < g_end) {
+                        const gtag = readVarint(fp) orelse break;
+                        const gfn = gtag >> 3;
+                        const gwt: u3 = @truncate(gtag & 7);
+                        if (gfn == 11 and gwt == 2) {
+                            const vi_len = readVarint(fp) orelse return false;
+                            const vi_start = ftell(fp);
+                            if (vi_start < 0 or vi_len > std.math.maxInt(c_long)) return false;
+                            const vi_end = vi_start + @as(c_long, @intCast(vi_len));
+                            while (ftell(fp) < vi_end) {
+                                const vtag = readVarint(fp) orelse break;
+                                const vfn = vtag >> 3;
+                                const vwt: u3 = @truncate(vtag & 7);
+                                if (vfn == 1 and vwt == 2) {
+                                    const nm_len = readVarint(fp) orelse break;
+                                    if (nm_len == "num_tokens".len) {
+                                        var nm_buf: ["num_tokens".len]u8 = undefined;
+                                        if (std.c.fread(&nm_buf, 1, nm_buf.len, fp) == nm_buf.len and
+                                            std.mem.eql(u8, &nm_buf, "num_tokens"))
+                                        {
+                                            return true;
+                                        }
+                                    } else {
+                                        if (!skipBytes(fp, nm_len)) break;
+                                    }
+                                } else {
+                                    if (!skipField(fp, vwt)) break;
+                                }
+                            }
+                            if (fseek(fp, vi_end, std.c.SEEK.SET) != 0) break;
+                        } else {
+                            if (!skipField(fp, gwt)) break;
+                        }
+                    }
+                    return false;
+                } else {
+                    if (!skipField(fp, wt)) break;
+                }
+            }
+            return false;
+        }
+    };
 
     fn checkStatus(api: *const c.OrtApi, status: ?*c.OrtStatus) !void {
         if (status) |st| {
@@ -69,7 +278,117 @@ pub const NeuralSession = struct {
         }
     }
 
+    fn checkStatusSilent(api: *const c.OrtApi, status: ?*c.OrtStatus) bool {
+        if (status) |st| {
+            const msg = api.GetErrorMessage.?(st);
+            std.log.warn("ONNX Runtime provider attempt: {s}", .{std.mem.span(msg)});
+            api.ReleaseStatus.?(st);
+            return false;
+        }
+        return true;
+    }
+
+    fn applyStaticShapeOverrides(
+        api: *const c.OrtApi,
+        opts: *c.OrtSessionOptions,
+        static_w: u32,
+        static_h: u32,
+    ) void {
+        if (static_w == 0 or static_h == 0) return;
+        const add_by_name = api.AddFreeDimensionOverrideByName orelse return;
+        const batch_names = [_][*:0]const u8{ "batch_size", "batch", "N", "num_views", "views", "S" };
+        for (batch_names) |nm| {
+            if (add_by_name(opts, nm, 1)) |st| api.ReleaseStatus.?(st);
+        }
+        const h_names = [_][*:0]const u8{ "height", "H" };
+        for (h_names) |nm| {
+            if (add_by_name(opts, nm, @intCast(static_h))) |st| api.ReleaseStatus.?(st);
+        }
+        const w_names = [_][*:0]const u8{ "width", "W" };
+        for (w_names) |nm| {
+            if (add_by_name(opts, nm, @intCast(static_w))) |st| api.ReleaseStatus.?(st);
+        }
+    }
+
+    fn tryCreateOpenVinoSession(
+        api: *const c.OrtApi,
+        env: *c.OrtEnv,
+        path_z: [:0]const u8,
+        threads: c_int,
+        ov_device: [:0]const u8,
+        static_w: u32,
+        static_h: u32,
+        cache_dir_z: ?[:0]const u8,
+    ) !struct { opts: *c.OrtSessionOptions, sess: *c.OrtSession } {
+        const append_ov = api.SessionOptionsAppendExecutionProvider_OpenVINO_V2 orelse return error.OpenVinoNotAvailable;
+
+        var opts_opt: ?*c.OrtSessionOptions = null;
+        try checkStatus(api, api.CreateSessionOptions.?(&opts_opt));
+        const opts = opts_opt orelse return error.OnnxInitFailed;
+        errdefer api.ReleaseSessionOptions.?(opts);
+
+        try checkStatus(api, api.SetIntraOpNumThreads.?(opts, threads));
+        try checkStatus(api, api.SetSessionGraphOptimizationLevel.?(opts, c.ORT_ENABLE_ALL));
+        applyStaticShapeOverrides(api, opts, static_w, static_h);
+
+        var tbuf: [16]u8 = undefined;
+        const threads_s = try std.fmt.bufPrint(&tbuf, "{d}", .{threads});
+        tbuf[threads_s.len] = 0;
+        const threads_z: [:0]const u8 = tbuf[0..threads_s.len :0];
+
+        var keys: [5][*:0]const u8 = undefined;
+        var vals: [5][*:0]const u8 = undefined;
+        var n_kv: usize = 0;
+
+        keys[n_kv] = "device_type";
+        vals[n_kv] = ov_device.ptr;
+        n_kv += 1;
+
+        keys[n_kv] = "precision";
+        vals[n_kv] = "FP16";
+        n_kv += 1;
+
+        // Keep a single OpenVINO infer request (num_of_threads=1, num_streams=1) on
+        // NPU for sequential per-view inference. In ORT OpenVINO EP 1.22.0, multi-request
+        // NPU pools only bind ORT output buffers on request #0, leaving requests #1..N
+        // returning stale outputs.
+        const is_npu_ov = std.mem.indexOf(u8, ov_device, "NPU") != null;
+        keys[n_kv] = "num_of_threads";
+        vals[n_kv] = if (is_npu_ov) "1" else threads_z.ptr;
+        n_kv += 1;
+
+        keys[n_kv] = "num_streams";
+        vals[n_kv] = "1";
+        n_kv += 1;
+
+        if (cache_dir_z) |cd| {
+            keys[n_kv] = "cache_dir";
+            vals[n_kv] = cd.ptr;
+            n_kv += 1;
+        }
+
+        if (!checkStatusSilent(api, append_ov(opts, &keys, &vals, n_kv))) {
+            return error.OpenVinoInitFailed;
+        }
+
+        var sess_opt: ?*c.OrtSession = null;
+        if (!checkStatusSilent(api, api.CreateSession.?(env, path_z.ptr, opts, &sess_opt))) {
+            return error.OpenVinoSessionFailed;
+        }
+        const session = sess_opt orelse return error.OpenVinoSessionFailed;
+        return .{ .opts = opts, .sess = session };
+    }
+
     pub fn init(zig_alloc: std.mem.Allocator, model_path: []const u8, num_threads: usize) !NeuralSession {
+        return initWithOptions(zig_alloc, model_path, num_threads, .{});
+    }
+
+    pub fn initWithOptions(
+        zig_alloc: std.mem.Allocator,
+        model_path: []const u8,
+        num_threads: usize,
+        sess_opts: NeuralSessionOptions,
+    ) !NeuralSession {
         const api_base = c.OrtGetApiBase();
         if (api_base == null) return error.OnnxInitFailed;
         const api_c = api_base.*.GetApi.?(c.ORT_API_VERSION);
@@ -81,22 +400,100 @@ pub const NeuralSession = struct {
         const env = env_opt orelse return error.OnnxInitFailed;
         errdefer api.ReleaseEnv.?(env);
 
-        var opts_opt: ?*c.OrtSessionOptions = null;
-        try checkStatus(api, api.CreateSessionOptions.?(&opts_opt));
-        const opts = opts_opt orelse return error.OnnxInitFailed;
-        errdefer api.ReleaseSessionOptions.?(opts);
-
         const threads: c_int = @intCast(if (num_threads == 0) (std.Thread.getCpuCount() catch 4) else num_threads);
-        try checkStatus(api, api.SetIntraOpNumThreads.?(opts, threads));
-        try checkStatus(api, api.SetSessionGraphOptimizationLevel.?(opts, c.ORT_ENABLE_ALL));
-
         const path_z = try zig_alloc.allocSentinel(u8, model_path.len, 0);
         defer zig_alloc.free(path_z);
         @memcpy(path_z, model_path);
 
-        var sess_opt: ?*c.OrtSession = null;
-        try checkStatus(api, api.CreateSession.?(env, path_z.ptr, opts, &sess_opt));
-        const session = sess_opt orelse return error.OnnxSessionFailed;
+        var cache_dir_z_opt: ?[:0]u8 = null;
+        defer if (cache_dir_z_opt) |cz| zig_alloc.free(cz);
+        if (sess_opts.device != .cpu) {
+            if (sess_opts.cache_dir) |cd| {
+                if (cd.len > 0) {
+                    if (sess_opts.io) |io_v| {
+                        std.Io.Dir.cwd().createDirPath(io_v, cd) catch {};
+                    }
+                    const cz = try zig_alloc.allocSentinel(u8, cd.len, 0);
+                    @memcpy(cz, cd);
+                    cache_dir_z_opt = cz;
+                }
+            }
+        }
+
+        var opts: *c.OrtSessionOptions = undefined;
+        var session: *c.OrtSession = undefined;
+        var active_device: NeuralDevice = sess_opts.device;
+        var active_ov_backend: ?[]const u8 = null;
+
+        if (sess_opts.device != .cpu) {
+            prepareOpenVinoNpuRuntime();
+            const npu_targeted = (sess_opts.device == .npu or sess_opts.device == .ov_auto);
+            if (npu_targeted and OnnxScanner.hasDynamicNumTokensInput(path_z)) {
+                std.log.warn(
+                    "Model '{s}' declares runtime 'num_tokens' dynamic-shape input unsupported by Intel NPU static MLIR compiler; falling back to CPU execution",
+                    .{model_path},
+                );
+                active_device = .cpu;
+            } else {
+                const primary_ov = sess_opts.device.ovDeviceType();
+                if (tryCreateOpenVinoSession(
+                    api,
+                    env,
+                    path_z,
+                    threads,
+                    primary_ov,
+                    sess_opts.static_w,
+                    sess_opts.static_h,
+                    cache_dir_z_opt,
+                )) |res| {
+                    opts = res.opts;
+                    session = res.sess;
+                    active_ov_backend = primary_ov;
+                } else |_| {
+                    var hetero_ok = false;
+                    if (sess_opts.device == .npu) {
+                        if (tryCreateOpenVinoSession(
+                            api,
+                            env,
+                            path_z,
+                            threads,
+                            "HETERO:NPU,CPU",
+                            sess_opts.static_w,
+                            sess_opts.static_h,
+                            cache_dir_z_opt,
+                        )) |res| {
+                            std.log.warn("Pure OpenVINO NPU session failed; using HETERO:NPU,CPU hybrid execution", .{});
+                            opts = res.opts;
+                            session = res.sess;
+                            active_ov_backend = "HETERO:NPU,CPU";
+                            hetero_ok = true;
+                        } else |_| {}
+                    }
+                    if (!hetero_ok) {
+                        std.log.warn("OpenVINO {s} unavailable for '{s}'; falling back to CPU execution", .{
+                            sess_opts.device.label(),
+                            model_path,
+                        });
+                        active_device = .cpu;
+                    }
+                }
+            }
+        }
+
+        if (active_device == .cpu) {
+            var opts_opt: ?*c.OrtSessionOptions = null;
+            try checkStatus(api, api.CreateSessionOptions.?(&opts_opt));
+            opts = opts_opt orelse return error.OnnxInitFailed;
+            errdefer api.ReleaseSessionOptions.?(opts);
+
+            try checkStatus(api, api.SetIntraOpNumThreads.?(opts, threads));
+            try checkStatus(api, api.SetSessionGraphOptimizationLevel.?(opts, c.ORT_ENABLE_ALL));
+
+            var sess_opt: ?*c.OrtSession = null;
+            try checkStatus(api, api.CreateSession.?(env, path_z.ptr, opts, &sess_opt));
+            session = sess_opt orelse return error.OnnxSessionFailed;
+        }
+        errdefer api.ReleaseSessionOptions.?(opts);
         errdefer api.ReleaseSession.?(session);
 
         var mem_info_opt: ?*c.OrtMemoryInfo = null;
@@ -184,6 +581,12 @@ pub const NeuralSession = struct {
             .input_0_ndim = input_0_ndim,
             .is_imagenet_norm = is_imagenet_norm,
             .num_tokens_ndim = num_tokens_ndim,
+            .active_device = active_device,
+            .active_ov_backend = active_ov_backend,
+            .static_w = sess_opts.static_w,
+            .static_h = sess_opts.static_h,
+            .input_bufs = .{ null, null },
+            .input_buf_toggle = 0,
             .zig_alloc = zig_alloc,
         };
     }
@@ -197,6 +600,12 @@ pub const NeuralSession = struct {
         self.api.ReleaseSession.?(self.session);
         self.api.ReleaseSessionOptions.?(self.opts);
         self.api.ReleaseEnv.?(self.env);
+        for (&self.input_bufs) |*slot| {
+            if (slot.*) |buf| {
+                self.zig_alloc.free(buf);
+                slot.* = null;
+            }
+        }
         self.* = undefined;
     }
 
@@ -215,8 +624,25 @@ pub const NeuralSession = struct {
         const tw: usize = target_w;
         const th: usize = target_h;
         const plane = tw * th;
-        const nchw = try allocator.alloc(f32, 3 * plane);
-        defer allocator.free(nchw);
+        const needed = 3 * plane;
+
+        // Ping-pong between two persistent input buffers so consecutive Run() calls
+        // always pass distinct, non-unmapped host addresses. OpenVINO NPU's
+        // ZeroInferRequest::set_tensor skips host->device updates when the incoming
+        // tensor pointer equals the previous call's address (which occurs when a
+        // per-call buffer is freed and reallocated at the same virtual address).
+        const slot = self.input_buf_toggle;
+        self.input_buf_toggle ^= 1;
+        const nchw: []f32 = blk: {
+            if (self.input_bufs[slot]) |existing| {
+                if (existing.len == needed) break :blk existing;
+                self.zig_alloc.free(existing);
+                self.input_bufs[slot] = null;
+            }
+            const fresh = try self.zig_alloc.alloc(f32, needed);
+            self.input_bufs[slot] = fresh;
+            break :blk fresh;
+        };
 
         if (self.is_imagenet_norm) {
             fillResizedNchwImageNet(rgb, src_w, src_h, target_w, target_h, nchw);
@@ -1438,17 +1864,45 @@ pub fn completeMeshHolesWithTransformer(
 
     if (config.timings) |tm| tm.* = .{};
 
-    const t_init0 = nowMs.stamp(config.io);
-    var sess = try NeuralSession.init(allocator, config.model_path, config.num_threads);
-    defer sess.deinit();
-    if (config.timings) |tm| tm.init_ms += nowMs.elapsed(config.io, t_init0);
-
     var reg_cams: std.ArrayList(usize) = .empty;
     defer reg_cams.deinit(allocator);
     for (registered, 0..) |is_reg, ci| {
         if (is_reg) try reg_cams.append(allocator, ci);
     }
     if (reg_cams.items.len == 0) return 0;
+
+    const targetDimsForImage = struct {
+        fn calc(iw: u32, ih: u32, max_dim: u32) struct { w: u32, h: u32 } {
+            const max_dim_f: f64 = @floatFromInt(@max(iw, ih));
+            const scale_in = @as(f64, @floatFromInt(max_dim)) / max_dim_f;
+            return .{
+                .w = roundUpDiv14(@intFromFloat(@max(112.0, @as(f64, @floatFromInt(iw)) * scale_in))),
+                .h = roundUpDiv14(@intFromFloat(@max(112.0, @as(f64, @floatFromInt(ih)) * scale_in))),
+            };
+        }
+    }.calc;
+
+    const first_img = images[reg_cams.items[0]];
+    const init_dims = targetDimsForImage(first_img.width, first_img.height, config.input_max_dim);
+
+    const t_init0 = nowMs.stamp(config.io);
+    var sess_opt: ?NeuralSession = try NeuralSession.initWithOptions(allocator, config.model_path, config.num_threads, .{
+        .device = config.device,
+        .static_w = init_dims.w,
+        .static_h = init_dims.h,
+        .cache_dir = config.npu_cache_dir,
+        .io = config.io,
+    });
+    defer if (sess_opt) |*s| s.deinit();
+    if (config.timings) |tm| tm.init_ms += nowMs.elapsed(config.io, t_init0);
+    std.log.info("Neural session active device: {s}{s}{s}{s} ({d}x{d})", .{
+        sess_opt.?.active_device.label(),
+        if (sess_opt.?.active_ov_backend != null) " [" else "",
+        sess_opt.?.active_ov_backend orelse "",
+        if (sess_opt.?.active_ov_backend != null) "]" else "",
+        init_dims.w,
+        init_dims.h,
+    });
 
     // Rasterize initial SfM mesh into all registered cameras for scale fitting & empty-space checks
     const t_pre0 = nowMs.stamp(config.io);
@@ -1557,13 +2011,26 @@ pub fn completeMeshHolesWithTransformer(
         }
         if (cur_cov_cnt * 100 >= cur_ren.covered.len * 97) continue;
 
-        const max_dim_f: f64 = @floatFromInt(@max(w, h));
-        const scale_in = @as(f64, @floatFromInt(config.input_max_dim)) / max_dim_f;
-        const target_w = roundUpDiv14(@intFromFloat(@max(112.0, @as(f64, @floatFromInt(w)) * scale_in)));
-        const target_h = roundUpDiv14(@intFromFloat(@max(112.0, @as(f64, @floatFromInt(h)) * scale_in)));
+        const td = targetDimsForImage(w, h, config.input_max_dim);
+        const target_w = td.w;
+        const target_h = td.h;
+
+        if (sess_opt.?.active_device != .cpu and (target_w != sess_opt.?.static_w or target_h != sess_opt.?.static_h)) {
+            const t_reinit0 = nowMs.stamp(config.io);
+            sess_opt.?.deinit();
+            sess_opt = null;
+            sess_opt = try NeuralSession.initWithOptions(allocator, config.model_path, config.num_threads, .{
+                .device = config.device,
+                .static_w = target_w,
+                .static_h = target_h,
+                .cache_dir = config.npu_cache_dir,
+                .io = config.io,
+            });
+            if (config.timings) |tm| tm.init_ms += nowMs.elapsed(config.io, t_reinit0);
+        }
 
         const t_inf0 = nowMs.stamp(config.io);
-        var pred = try sess.predict(allocator, img.rgb, w, h, target_w, target_h, config.num_tokens);
+        var pred = try sess_opt.?.predict(allocator, img.rgb, w, h, target_w, target_h, config.num_tokens);
         if (config.timings) |tm| tm.infer_ms += nowMs.elapsed(config.io, t_inf0);
         defer pred.deinit(allocator);
 
@@ -2026,4 +2493,93 @@ test "MoGe-2 and Depth Anything ONNX models load and predict depth when present"
     try verifyOnnxModelSmoke("models/moge-2-vitb-normal.onnx");
     try verifyOnnxModelSmoke("models/depth-anything-v3-base/model.onnx");
     try verifyOnnxModelSmoke("models/depth-anything-v2-base.onnx");
+    try verifyOnnxModelSmoke("models/depth-anything-v2-small.onnx");
+}
+
+test "NeuralDevice parsing and OpenVINO NPU initWithOptions gracefully loads or falls back" {
+    try std.testing.expectEqual(NeuralDevice.npu, try NeuralDevice.parse("npu"));
+    try std.testing.expectEqual(NeuralDevice.npu, try NeuralDevice.parse("NPU"));
+    try std.testing.expectEqual(NeuralDevice.ov_gpu, try NeuralDevice.parse("gpu"));
+    try std.testing.expectEqual(NeuralDevice.ov_gpu, try NeuralDevice.parse("openvino-gpu"));
+    try std.testing.expectEqual(NeuralDevice.ov_auto, try NeuralDevice.parse("auto"));
+    try std.testing.expectEqual(NeuralDevice.cpu, try NeuralDevice.parse("cpu"));
+    try std.testing.expectEqualStrings("NPU", NeuralDevice.npu.ovDeviceType());
+    try std.testing.expectEqualStrings("AUTO:NPU,GPU,CPU", NeuralDevice.ov_auto.ovDeviceType());
+    try std.testing.expectEqualStrings("NPU (OpenVINO)", NeuralDevice.npu.label());
+    try std.testing.expectError(error.InvalidNeuralDevice, NeuralDevice.parse("tpu"));
+
+    const gpa = std.testing.allocator;
+    const model_path = "models/depth-anything-v2-small.onnx";
+    std.Io.Dir.cwd().access(std.testing.io, model_path, .{}) catch return;
+
+    var sess = try NeuralSession.initWithOptions(gpa, model_path, 4, .{
+        .device = .npu,
+        .static_w = 504,
+        .static_h = 336,
+        .cache_dir = ".zig-cache/ov_npu_cache",
+        .io = std.testing.io,
+    });
+    defer sess.deinit();
+
+    const w: u32 = 504;
+    const h: u32 = 336;
+    const rgb_a = try gpa.alloc(u8, w * h * 3);
+    defer gpa.free(rgb_a);
+    const rgb_b = try gpa.alloc(u8, w * h * 3);
+    defer gpa.free(rgb_b);
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const idx = (y * w + x) * 3;
+            rgb_a[idx + 0] = @intCast((x * 255) / w);
+            rgb_a[idx + 1] = 64;
+            rgb_a[idx + 2] = @intCast(255 - (x * 255) / w);
+
+            rgb_b[idx + 0] = @intCast((y * 255) / h);
+            rgb_b[idx + 1] = @intCast(255 - (y * 255) / h);
+            rgb_b[idx + 2] = 192;
+        }
+    }
+
+    var pred_a = try sess.predict(gpa, rgb_a, w, h, w, h, 256);
+    defer pred_a.deinit(gpa);
+    var pred_b = try sess.predict(gpa, rgb_b, w, h, w, h, 256);
+    defer pred_b.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, w) * @as(usize, h), pred_a.depth.len);
+    try std.testing.expectEqual(@as(usize, w) * @as(usize, h), pred_b.depth.len);
+
+    // Consecutive calls with distinct images must produce distinct predictions
+    // (catches OpenVINO EP multi-stream / stale output buffer regressions).
+    var mean_ab_diff: f64 = 0.0;
+    for (pred_a.depth, pred_b.depth) |da, db| {
+        try std.testing.expect(std.math.isFinite(da) and std.math.isFinite(db));
+        mean_ab_diff += @abs(@as(f64, da) - @as(f64, db));
+    }
+    mean_ab_diff /= @as(f64, @floatFromInt(pred_a.depth.len));
+    try std.testing.expect(mean_ab_diff > 0.05);
+
+    // Verify NPU/OpenVINO output closely matches CPU reference on the second call.
+    var cpu_sess = try NeuralSession.init(gpa, model_path, 4);
+    defer cpu_sess.deinit();
+    var cpu_pred_b = try cpu_sess.predict(gpa, rgb_b, w, h, w, h, 256);
+    defer cpu_pred_b.deinit(gpa);
+
+    var mean_cpu_diff: f64 = 0.0;
+    for (pred_b.depth, cpu_pred_b.depth) |dn, dc| {
+        mean_cpu_diff += @abs(@as(f64, dn) - @as(f64, dc));
+    }
+    mean_cpu_diff /= @as(f64, @floatFromInt(pred_b.depth.len));
+    try std.testing.expect(mean_cpu_diff < 0.05);
+
+    // Models with dynamic `num_tokens` shape input (MoGe-2) must fall back cleanly to CPU
+    // without triggering an Intel NPU MLIR compiler abort.
+    const moge_path = "models/moge-2-vitb-normal.onnx";
+    if (std.Io.Dir.cwd().access(std.testing.io, moge_path, .{})) |_| {
+        var moge_sess = try NeuralSession.initWithOptions(gpa, moge_path, 4, .{
+            .device = .npu,
+            .static_w = 504,
+            .static_h = 336,
+        });
+        defer moge_sess.deinit();
+        try std.testing.expectEqual(NeuralDevice.cpu, moge_sess.active_device);
+    } else |_| {}
 }

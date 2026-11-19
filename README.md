@@ -17,7 +17,8 @@ Starting from a calibrated multi-view photo collection (`K.txt` + images), **`3d
 3. **Surface Meshing & Photometric Completion ([`src/mesh.zig`](src/mesh.zig))**
    - View-consistent Delaunay meshing (`buildColoredMesh`), multi-view photo-verified edge bridging (`completeMeshWithPhotoVerify`), interior boundary-loop triangulation (`fillMeshInteriorHoles`), and Z-buffered multi-view texture subdivision (`subdivideAndProjectTexture`).
 4. **Optional 3D Transformer Hole Completion ([`src/neural_depth.zig`](src/neural_depth.zig))**
-   - Optional `--nn-model <onnx>` pass using native bindings to **ONNX Runtime** (`c_ort.h`) supporting **MoGe-2 ViT-B** (`moge-2-vitb-normal.onnx`), **Depth Anything 2 Base** (`depth-anything-v2-base.onnx`), and **Depth Anything 3 Base** (`depth-anything-v3-base/model.onnx`).
+   - Optional `--nn-model <onnx>` pass using native bindings to **ONNX Runtime** (`c_ort.h`) supporting **MoGe-2 ViT-B** (`moge-2-vitb-normal.onnx`), **Depth Anything 2 Small/Base** (`depth-anything-v2-small.onnx`, `depth-anything-v2-base.onnx`), and **Depth Anything 3 Base** (`depth-anything-v3-base/model.onnx`).
+   - Optional **Intel NPU / OpenVINO Execution Provider** acceleration via `--npu` (or `--nn-device <cpu|npu|gpu|auto>`), fixing static input shapes with `AddFreeDimensionOverrideByName`, caching compiled NPU blobs in `.zig-cache/ov_npu_cache`, and falling back gracefully (`NPU` -> `HETERO:NPU,CPU` -> `CPU`) when NPU hardware is unavailable or a model uses data-dependent dynamic shapes (such as MoGe-2's runtime `num_tokens` input).
    - Schedules viewpoints widest-hole-first, aligns both direct depth (`+Z`, via `fitAffineDepthWeightedIrlS` / `fitMonotoneQuadDepthWeightedIrlS`) and relative inverse disparity (`1/Z`, via `fitDisparityDepthWeightedIrlS`) to SfM scale across 16 log-depth octave bins, and stitches hole surfaces on a regular grid with silhouette depth-jump guards.
 5. **From-Scratch Instant-NGP NeRF & Marching Cubes Export ([`src/nerf.zig`](src/nerf.zig), [`src/nerf_gpu.zig`](src/nerf_gpu.zig), [`src/marching_cubes.zig`](src/marching_cubes.zig))**
    - Optional `--nerf` pipeline training a multi-resolution spatial `HashGrid` (`12` levels, `2^18` table size on GPU) with spherical-harmonics view conditioning, two-layer geometry/color MLPs, Adam optimization, and dense SfM depth-seeded `OccupancyGrid` culling.
@@ -34,8 +35,21 @@ Starting from a calibrated multi-view photo collection (`K.txt` + images), **`3d
   - `glfw`, `GL`, `X11` (for `sfm_viewer`)
 - **In-project native runtimes** (binary `.so`/`.onnx` artifacts are excluded from Git via [`.gitignore`](.gitignore)):
   - [`third_party/wgpu-native/`](third_party/wgpu-native) (`v27.0.4.0` headers + shared library under `third_party/wgpu-native/lib/`)
-  - [`third_party/onnxruntime/`](third_party/onnxruntime) (`v1.22.0` headers tracked + `libonnxruntime.so` under `third_party/onnxruntime/lib/`)
-  - Optional ONNX models in `models/` for `--nn-model` (`depth-anything-v2-base.onnx`, `depth-anything-v3-base/model.onnx`, or `moge-2-vitb-normal.onnx`)
+  - [`third_party/onnxruntime/`](third_party/onnxruntime) (`v1.22.0` headers tracked + `libonnxruntime.so` under `third_party/onnxruntime/lib/`; for `--npu` / `--nn-device`, place the `onnxruntime-openvino` `1.22.0` provider, OpenVINO runtime/NPU plugin, Level Zero loader/Intel NPU driver (`libze_loader.so.1`, `libze_intel_npu.so.1`), NPU compiler (`libopenvino_intel_npu_compiler*.so`), and `libtbb.so.12` in `third_party/onnxruntime/lib/`)
+  - Optional ONNX models in `models/` for `--nn-model` (`depth-anything-v2-small.onnx`, `depth-anything-v2-base.onnx`, `depth-anything-v3-base/model.onnx`, or `moge-2-vitb-normal.onnx`)
+
+### Intel NPU Setup (Linux `/dev/accel/accel0`)
+
+Running `--npu` (or `--nn-device npu`) executes supported static-shape ONNX models on Intel NPU hardware via ONNX Runtime's OpenVINO Execution Provider (`FP16`, single infer-request stream, compiled blob cache in `.zig-cache/ov_npu_cache`).
+
+1. **Runtime libraries**: Place the `onnxruntime-openvino 1.22.0`, OpenVINO (`libopenvino*.so`, `libopenvino_intel_npu_plugin.so`, `libopenvino_intel_npu_compiler*.so`), Intel NPU Level Zero (`libze_loader.so.1`, `libze_intel_npu.so.1`), and TBB (`libtbb.so.12`) shared libraries in `third_party/onnxruntime/lib/`. The binary automatically preloads co-located NPU libraries and sets `ZE_ENABLE_ALT_DRIVERS` if unset, so no `LD_LIBRARY_PATH` wrapper is required.
+2. **Device permissions**: The Linux `intel_vpu` kernel driver exposes the NPU at `/dev/accel/accel0` (owned by `root:render`). If opening `/dev/accel/accel0` fails with `Permission denied`, add your user to the `render` group and start a new login session:
+   ```bash
+   sudo usermod -aG render "$USER"
+   # Log out and back in (or run `newgrp render` in the current shell), then verify:
+   ls -l /dev/accel/accel0
+   ```
+3. **Graceful fallback**: If the NPU device is inaccessible, OpenVINO EP is not installed, or the selected model declares data-dependent dynamic shapes (such as MoGe-2's runtime `num_tokens` input), `NeuralSession` tries `NPU` -> `HETERO:NPU,CPU` (for compatible graphs) and falls back cleanly to CPU execution.
 
 ## Building & Testing
 
@@ -52,7 +66,7 @@ zig build -Doptimize=ReleaseFast
 ### Reconstruction CLI (`3d_reconstruction`)
 
 ```bash
-# SfM + MoGe-2 ONNX hole-completed textured mesh
+# SfM + MoGe-2 ONNX hole-completed textured mesh (CPU)
 ./zig-out/bin/3d_reconstruction \
   --data data/fountain-p11 \
   --threads 8 \
@@ -60,6 +74,16 @@ zig build -Doptimize=ReleaseFast
   --nn-model models/moge-2-vitb-normal.onnx \
   --out output/fountain_nn.ply \
   --verify-views output/views_nn
+
+# Intel NPU neural hole completion (Depth Anything V2 Small via OpenVINO EP)
+./zig-out/bin/3d_reconstruction \
+  --data data/fountain-p11 \
+  --threads 8 \
+  --gpu \
+  --nn-model models/depth-anything-v2-small.onnx \
+  --npu \
+  --out output/fountain_npu.ply \
+  --verify-views output/views_npu
 
 # WebGPU Instant-NGP NeRF training + Marching Cubes .ply export
 ./zig-out/bin/3d_reconstruction \
@@ -80,6 +104,8 @@ zig build -Doptimize=ReleaseFast
 | `--threads <n>` | `1` | Worker threads for SfM, ONNX Runtime, CPU NeRF, and Marching Cubes |
 | `--gpu` | `false` | Enable WebGPU compute acceleration for feature detection, matching, and NeRF |
 | `--nn-model <onnx>` | *none* | Path to local ONNX 3D Transformer depth model for hole completion |
+| `--npu` | `false` | Shorthand for `--nn-device npu` (run `--nn-model` on Intel NPU via OpenVINO EP) |
+| `--nn-device <dev>` | `cpu` | Execution device for `--nn-model`: `cpu`, `npu`, `gpu` (OpenVINO GPU), or `auto` (`AUTO:NPU,GPU,CPU`) |
 | `--nerf` | `false` | Train Instant-NGP NeRF from SfM poses and export a Marching Cubes `.ply` |
 | `--nerf-steps <n>` | `1500` | Number of Instant-NGP training steps |
 | `--verify-views <dir>` | *none* | Render real/virtual/holdout/novel `.ppm` views and print PSNR/SSIM/coverage |
@@ -154,3 +180,14 @@ zig build -Doptimize=ReleaseFast
 | Texture Projection | `293.3` | `279.3` | `278.0` | `640.3` | `592.2` | `618.4` | `0.0` |
 | ASCII `.ply` Export | `65.4` | `60.0` | `56.5` | `218.9` | `3034.7` | `1888.6` | `639.7` |
 | **Total End-to-End** | **`15878.2`** | **`5427.0`** | **`3958.4`** | **`14794.8`** | **`19153.3`** | **`46607.6`** | **`434967.6`** |
+
+### Intel NPU 4000 Acceleration (`depth-anything-v2-small.onnx`, `504x336`, 11 views)
+
+Measured on Intel Core Ultra with Intel NPU 4000 (`--gpu --threads 8`):
+
+| Backend | NN Init | NN Inference (11 views) | Mean Coverage | PSNR | SSIM |
+| --- | --- | --- | --- | --- | --- |
+| CPU (`--nn-device cpu`) | `168.7 ms` | `2398.2 ms` (`~218 ms/view`) | `97.6%` | `24.10 dB` | `0.7237` |
+| **Intel NPU 4000 (`--npu`, warm blob cache)** | `413.6 ms` | **`492.6 ms`** (`~44.8 ms/view`, **4.9x faster**) | **`97.7%`** | **`24.10 dB`** | **`0.7231`** |
+
+*(First-run cold NPU compilation takes `~5.5 s` and caches the compiled blob under `.zig-cache/ov_npu_cache` for subsequent runs.)*

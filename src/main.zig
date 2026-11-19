@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const opts = try sfm.parseCliArgs(args);
     if (opts.show_help) {
         std.debug.print(
-            "Usage: 3d_reconstruction [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--gpu] [--nn-model <onnx>] [--nerf] [--nerf-steps <n>] [--verify-views <dir>]\n",
+            "Usage: 3d_reconstruction [--data <dir>] [--out <ply>] [--max-dim <px>] [--threads <n>] [--gpu] [--nn-model <onnx>] [--npu] [--nn-device <cpu|npu|gpu|auto>] [--nerf] [--nerf-steps <n>] [--verify-views <dir>]\n",
             .{},
         );
         return;
@@ -229,7 +229,7 @@ pub fn main(init: std.process.Init) !void {
         loop_ms = elapsedMs(io, t_loop0);
 
         if (opts.nn_model_path) |nn_path| {
-            std.log.info("Running 3D Transformer hole completion with '{s}'...", .{nn_path});
+            std.log.info("Running 3D Transformer hole completion with '{s}' (device={s})...", .{ nn_path, opts.nn_device.label() });
             const t_nn0 = Io.Clock.now(.awake, io);
             const added_nn = try sfm.neural_depth.completeMeshHolesWithTransformer(
                 gpa,
@@ -238,7 +238,13 @@ pub fn main(init: std.process.Init) !void {
                 images,
                 result.poses,
                 result.registered,
-                .{ .model_path = nn_path, .num_threads = num_threads, .io = io, .timings = &nn_timings },
+                .{
+                    .model_path = nn_path,
+                    .num_threads = num_threads,
+                    .device = opts.nn_device,
+                    .io = io,
+                    .timings = &nn_timings,
+                },
             );
             nn_ms = elapsedMs(io, t_nn0);
             std.log.info("Transformer added {d} hole vertices in {d:.1} ms -> {d} vertices, {d} triangles", .{
