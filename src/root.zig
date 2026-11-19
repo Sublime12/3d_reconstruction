@@ -27,6 +27,7 @@ pub const CliOptions = struct {
     num_threads: usize = 1,
     use_gpu: bool = false,
     nn_model_path: ?[]const u8 = null,
+    nn_device: neural_depth.NeuralDevice = .cpu,
     verify_views_dir: ?[]const u8 = null,
     use_nerf: bool = false,
     nerf_steps: usize = 1500,
@@ -54,6 +55,11 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         } else if (std.mem.eql(u8, args[i], "--nn-model") and i + 1 < args.len) {
             i += 1;
             opts.nn_model_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--npu")) {
+            opts.nn_device = .npu;
+        } else if (std.mem.eql(u8, args[i], "--nn-device") and i + 1 < args.len) {
+            i += 1;
+            opts.nn_device = try neural_depth.NeuralDevice.parse(args[i]);
         } else if (std.mem.eql(u8, args[i], "--verify-views") and i + 1 < args.len) {
             i += 1;
             opts.verify_views_dir = args[i];
@@ -83,6 +89,7 @@ test "parseCliArgs parses flags" {
         "--gpu",
         "--nn-model",
         "models/moge-2-vitb-normal.onnx",
+        "--npu",
         "--verify-views",
         "output/views",
         "--nerf",
@@ -96,10 +103,19 @@ test "parseCliArgs parses flags" {
     try std.testing.expectEqual(@as(usize, 4), opts.num_threads);
     try std.testing.expect(opts.use_gpu);
     try std.testing.expectEqualStrings("models/moge-2-vitb-normal.onnx", opts.nn_model_path.?);
+    try std.testing.expectEqual(neural_depth.NeuralDevice.npu, opts.nn_device);
     try std.testing.expectEqualStrings("output/views", opts.verify_views_dir.?);
     try std.testing.expect(opts.use_nerf);
     try std.testing.expectEqual(@as(usize, 900), opts.nerf_steps);
     try std.testing.expect(!opts.show_help);
+
+    const dev_gpu = try parseCliArgs(&.{ "sfm", "--nn-device", "gpu" });
+    try std.testing.expectEqual(neural_depth.NeuralDevice.ov_gpu, dev_gpu.nn_device);
+    const dev_auto = try parseCliArgs(&.{ "sfm", "--nn-device", "auto" });
+    try std.testing.expectEqual(neural_depth.NeuralDevice.ov_auto, dev_auto.nn_device);
+    const dev_cpu = try parseCliArgs(&.{ "sfm", "--npu", "--nn-device", "cpu" });
+    try std.testing.expectEqual(neural_depth.NeuralDevice.cpu, dev_cpu.nn_device);
+    try std.testing.expectError(error.InvalidNeuralDevice, parseCliArgs(&.{ "sfm", "--nn-device", "tpu" }));
 }
 
 test {
